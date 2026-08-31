@@ -9,46 +9,61 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 
-// ==========================================
-// MIDDLEWARE
-// ==========================================
+/* ==========================================
+   MIDDLEWARE
+========================================== */
 
 app.use(cors());
 
 app.use(express.json());
 
 
-// ==========================================
-// DATA
-// ==========================================
+/* ==========================================
+   DARE QUEUE
+========================================== */
+
+const dareQueue = [];
 
 let currentDare = null;
 
 let dareCounter = 0;
 
 
-// ==========================================
-// BASIC SERVER TEST
-// ==========================================
+/* ==========================================
+   BASIC SERVER
+========================================== */
 
 app.get("/", (req, res) => {
 
   res.json({
+
     status: "online",
-    service: "Dare Backend"
+
+    service: "Dare Backend",
+
+    queueLength:
+      dareQueue.length,
+
+    currentDare:
+      currentDare
+
   });
 
 });
 
 
-// ==========================================
-// WEBSOCKET SERVER
-// ==========================================
+/* ==========================================
+   WEBSOCKET
+========================================== */
 
-const wss = new WebSocket.Server({
-  server: server,
-  path: "/ws"
-});
+const wss =
+  new WebSocket.Server({
+
+    server: server,
+
+    path: "/ws"
+
+  });
 
 
 function broadcast(message) {
@@ -56,134 +71,259 @@ function broadcast(message) {
   const data =
     JSON.stringify(message);
 
-  wss.clients.forEach((client) => {
 
-    if (
-      client.readyState ===
-      WebSocket.OPEN
-    ) {
+  wss.clients.forEach(
+    (client) => {
 
-      client.send(data);
+      if (
+        client.readyState ===
+        WebSocket.OPEN
+      ) {
+
+        client.send(data);
+
+      }
 
     }
-
-  });
+  );
 
 }
 
 
-wss.on("connection", (socket) => {
+/* ==========================================
+   SEND CURRENT STATE
+========================================== */
 
-  console.log(
-    "WebSocket client connected"
+function sendState(socket) {
+
+  socket.send(
+
+    JSON.stringify({
+
+      type:
+        "STATE",
+
+      currentDare:
+        currentDare,
+
+      queue:
+        dareQueue
+
+    })
+
   );
 
+}
 
-  // Send the current dare
-  // to a newly connected client.
+
+/* ==========================================
+   WEBSOCKET CONNECTION
+========================================== */
+
+wss.on(
+  "connection",
+  (socket) => {
+
+    console.log(
+      "WebSocket client connected"
+    );
+
+
+    sendState(socket);
+
+
+    socket.on(
+      "close",
+      () => {
+
+        console.log(
+          "WebSocket client disconnected"
+        );
+
+      }
+    );
+
+  }
+);
+
+
+/* ==========================================
+   MOVE NEXT DARE INTO CURRENT
+========================================== */
+
+function processNextDare() {
 
   if (currentDare) {
 
-    socket.send(
-      JSON.stringify({
-        type: "NEW_DARE",
-        dare: currentDare
-      })
-    );
+    return;
 
   }
 
 
-  socket.on("close", () => {
+  if (
+    dareQueue.length === 0
+  ) {
 
-    console.log(
-      "WebSocket client disconnected"
-    );
-
-  });
-
-});
-
-
-// ==========================================
-// CREATE DARE
-// ==========================================
-
-app.post("/api/dare", (req, res) => {
-
-  const {
-    viewer,
-    text,
-    duration
-  } = req.body;
-
-
-  if (!text || !text.trim()) {
-
-    return res.status(400).json({
-
-      error: "Dare text is required."
-
-    });
+    return;
 
   }
 
 
-  dareCounter++;
-
-
-  currentDare = {
-
-    id: String(dareCounter),
-
-    viewer:
-      viewer ||
-      "Anonymous",
-
-    text:
-      text.trim(),
-
-    duration:
-      Number(duration) || 30,
-
-    status:
-      "pending",
-
-    createdAt:
-      new Date().toISOString()
-
-  };
+  currentDare =
+    dareQueue.shift();
 
 
   console.log(
-    "New dare:",
+    "Now processing dare:",
     currentDare
   );
 
 
   broadcast({
 
-    type: "NEW_DARE",
+    type:
+      "NEW_DARE",
 
-    dare: currentDare
+    dare:
+      currentDare,
 
-  });
-
-
-  res.status(201).json({
-
-    success: true,
-
-    dare: currentDare
+    queue:
+      dareQueue
 
   });
 
-});
+}
 
 
-// ==========================================
-// UPDATE DARE STATUS
-// ==========================================
+/* ==========================================
+   CREATE DARE
+========================================== */
+
+app.post(
+  "/api/dare",
+  (req, res) => {
+
+    const {
+      viewer,
+      text,
+      duration,
+      reward
+    } = req.body;
+
+
+    if (
+      !text ||
+      !text.trim()
+    ) {
+
+      return res.status(400).json({
+
+        error:
+          "Dare text is required."
+
+      });
+
+    }
+
+
+    dareCounter++;
+
+
+    const dare = {
+
+      id:
+        String(dareCounter),
+
+      viewer:
+        viewer ||
+        "Anonymous",
+
+      text:
+        text.trim(),
+
+      duration:
+        Number(duration) || 30,
+
+      reward:
+        Number(reward) || 0,
+
+      status:
+        "pending",
+
+      createdAt:
+        new Date().toISOString()
+
+    };
+
+
+    dareQueue.push(dare);
+
+
+    console.log(
+      "Dare added to queue:",
+      dare
+    );
+
+
+    processNextDare();
+
+
+    broadcast({
+
+      type:
+        "QUEUE_UPDATED",
+
+      queue:
+        dareQueue,
+
+      currentDare:
+        currentDare
+
+    });
+
+
+    res.status(201).json({
+
+      success:
+        true,
+
+      dare:
+        dare,
+
+      queuePosition:
+        dareQueue.length
+
+    });
+
+  }
+);
+
+
+/* ==========================================
+   GET CURRENT STATE
+========================================== */
+
+app.get(
+  "/api/dare",
+  (req, res) => {
+
+    res.json({
+
+      currentDare:
+        currentDare,
+
+      queue:
+        dareQueue
+
+    });
+
+  }
+);
+
+
+/* ==========================================
+   UPDATE DARE STATUS
+========================================== */
 
 app.post(
   "/api/dare/:id/status",
@@ -213,7 +353,9 @@ app.post(
 
 
     if (
-      !allowedStatuses.includes(status)
+      !allowedStatuses.includes(
+        status
+      )
     ) {
 
       return res.status(400).json({
@@ -261,7 +403,7 @@ app.post(
 
 
     console.log(
-      "Dare status:",
+      "Dare status changed:",
       currentDare
     );
 
@@ -272,50 +414,104 @@ app.post(
         "DARE_STATUS",
 
       dare:
-        currentDare
+        currentDare,
+
+      queue:
+        dareQueue
 
     });
 
 
-    // Clear the dare after
-    // it has finished.
+    /*
+    ========================================
+    FINISHED DARE
+    ========================================
+    */
 
     if (
+
       status === "completed" ||
+
       status === "failed" ||
+
       status === "rejected"
+
     ) {
 
-      setTimeout(() => {
 
-        if (
-          currentDare &&
-          currentDare.id === id
-        ) {
+      setTimeout(
+        () => {
 
-          currentDare = null;
+          /*
+          Only clear if this is
+          still the same dare.
+          */
+
+          if (
+
+            currentDare &&
+
+            currentDare.id === id
+
+          ) {
+
+            currentDare =
+              null;
 
 
-          broadcast({
+            broadcast({
 
-            type:
-              "DARE_CLEARED"
+              type:
+                "DARE_CLEARED",
 
-          });
+              queue:
+                dareQueue
 
-        }
+            });
 
-      }, 1500);
+
+            /*
+            Automatically process
+            the next queued dare.
+            */
+
+            processNextDare();
+
+
+            broadcast({
+
+              type:
+                "QUEUE_UPDATED",
+
+              queue:
+                dareQueue,
+
+              currentDare:
+                currentDare
+
+            });
+
+          }
+
+        },
+
+        1500
+
+      );
 
     }
 
 
     res.json({
 
-      success: true,
+      success:
+        true,
 
       dare:
-        currentDare
+        currentDare,
+
+      queue:
+        dareQueue
 
     });
 
@@ -323,18 +519,32 @@ app.post(
 );
 
 
-// ==========================================
-// GET CURRENT DARE
-// ==========================================
+/* ==========================================
+   CLEAR EVERYTHING
+   ========================================== */
 
-app.get(
-  "/api/dare",
+app.post(
+  "/api/dare/clear",
   (req, res) => {
+
+    dareQueue.length = 0;
+
+    currentDare =
+      null;
+
+
+    broadcast({
+
+      type:
+        "RESET"
+
+    });
+
 
     res.json({
 
-      dare:
-        currentDare
+      success:
+        true
 
     });
 
@@ -342,19 +552,25 @@ app.get(
 );
 
 
-// ==========================================
-// START SERVER
-// ==========================================
+/* ==========================================
+   START SERVER
+========================================== */
 
 server.listen(
+
   PORT,
+
   "0.0.0.0",
+
   () => {
 
     console.log(
+
       `Dare Backend running on port ${PORT}`
+
     );
 
   }
+
 );
 
