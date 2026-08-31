@@ -113,6 +113,38 @@ function sendState(socket) {
 
   );
 
+
+  /*
+  ==========================================
+  ACTIVE DARE RECOVERY
+
+  If someone refreshes the homepage while
+  a dare is already accepted, immediately
+  tell the new client about it.
+  ==========================================
+  */
+
+  if (
+    currentDare &&
+    currentDare.status === "accepted"
+  ) {
+
+    socket.send(
+
+      JSON.stringify({
+
+        type:
+          "ACTIVE_DARE",
+
+        dare:
+          currentDare
+
+      })
+
+    );
+
+  }
+
 }
 
 
@@ -128,6 +160,11 @@ wss.on(
       "WebSocket client connected"
     );
 
+
+    /*
+    Send current queue/current dare
+    immediately after connection.
+    */
 
     sendState(socket);
 
@@ -204,11 +241,37 @@ app.post(
   (req, res) => {
 
     const {
+
+      streamer,
+
       viewer,
+
       text,
+
       duration,
+
       reward
+
     } = req.body;
+
+
+    /* =========================
+       VALIDATION
+    ========================= */
+
+    if (
+      !streamer ||
+      !streamer.trim()
+    ) {
+
+      return res.status(400).json({
+
+        error:
+          "Streamer username is required."
+
+      });
+
+    }
 
 
     if (
@@ -226,6 +289,10 @@ app.post(
     }
 
 
+    /* =========================
+       CREATE DARE
+    ========================= */
+
     dareCounter++;
 
 
@@ -234,21 +301,56 @@ app.post(
       id:
         String(dareCounter),
 
+
+      /*
+      Twitch streamer username
+      */
+
+      streamer:
+        streamer.trim(),
+
+
+      /*
+      Viewer name
+      */
+
       viewer:
-        viewer ||
-        "Anonymous",
+        viewer
+          ? viewer.trim()
+          : "Anonymous",
+
+
+      /*
+      Dare text
+      */
 
       text:
         text.trim(),
 
+
+      /*
+      Duration
+      */
+
       duration:
         Number(duration) || 30,
+
+
+      /*
+      Reward
+      */
 
       reward:
         Number(reward) || 0,
 
+
+      /*
+      Initial status
+      */
+
       status:
         "pending",
+
 
       createdAt:
         new Date().toISOString()
@@ -265,8 +367,18 @@ app.post(
     );
 
 
+    /*
+    Process queue if no dare
+    is currently active.
+    */
+
     processNextDare();
 
+
+    /*
+    Tell connected clients that
+    the queue changed.
+    */
 
     broadcast({
 
@@ -352,6 +464,10 @@ app.post(
     ];
 
 
+    /* =========================
+       VALIDATE STATUS
+    ========================= */
+
     if (
       !allowedStatuses.includes(
         status
@@ -367,6 +483,10 @@ app.post(
 
     }
 
+
+    /* =========================
+       CHECK CURRENT DARE
+    ========================= */
 
     if (!currentDare) {
 
@@ -394,6 +514,10 @@ app.post(
     }
 
 
+    /* =========================
+       UPDATE STATUS
+    ========================= */
+
     currentDare.status =
       status;
 
@@ -407,6 +531,10 @@ app.post(
       currentDare
     );
 
+
+    /* =========================
+       BROADCAST STATUS
+    ========================= */
 
     broadcast({
 
@@ -422,11 +550,39 @@ app.post(
     });
 
 
-    /*
-    ========================================
-    FINISHED DARE
-    ========================================
-    */
+    /* =====================================
+       ACCEPTED
+       
+       This is what activates the
+       LIVE DARE Twitch section.
+    ===================================== */
+
+    if (
+      status === "accepted"
+    ) {
+
+      console.log(
+        "ACTIVE DARE:",
+        currentDare
+      );
+
+
+      broadcast({
+
+        type:
+          "ACTIVE_DARE",
+
+        dare:
+          currentDare
+
+      });
+
+    }
+
+
+    /* =====================================
+       FINISHED DARE
+    ===================================== */
 
     if (
 
@@ -438,6 +594,31 @@ app.post(
 
     ) {
 
+
+      /*
+      Tell the website immediately
+      that the active dare is ending.
+      */
+
+      broadcast({
+
+        type:
+          "DARE_ENDED",
+
+        status:
+          status,
+
+        dare:
+          currentDare
+
+      });
+
+
+      /*
+      Wait briefly so the controller
+      and overlay can display the
+      final result.
+      */
 
       setTimeout(
         () => {
@@ -459,6 +640,12 @@ app.post(
               null;
 
 
+            /*
+            Tell all connected
+            clients the active
+            dare is gone.
+            */
+
             broadcast({
 
               type:
@@ -477,6 +664,10 @@ app.post(
 
             processNextDare();
 
+
+            /*
+            Update queue state.
+            */
 
             broadcast({
 
@@ -502,6 +693,10 @@ app.post(
     }
 
 
+    /* =========================
+       RESPONSE
+    ========================= */
+
     res.json({
 
       success:
@@ -521,7 +716,7 @@ app.post(
 
 /* ==========================================
    CLEAR EVERYTHING
-   ========================================== */
+========================================== */
 
 app.post(
   "/api/dare/clear",
@@ -573,4 +768,3 @@ server.listen(
   }
 
 );
-
