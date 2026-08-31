@@ -19,12 +19,60 @@ app.use(express.json());
 
 
 /* ==========================================
-   DARE QUEUE
+   DATA
 ========================================== */
 
-const dareQueue = [];
+/*
+   QUEUES ARE NOW SEPARATED BY STREAMER
 
-let currentDare = null;
+   Example:
+
+   streamerA:
+      [ dare1, dare2 ]
+
+   streamerB:
+      [ dare3, dare4 ]
+*/
+
+const streamerQueues = {};
+
+
+/*
+   ACTIVE DARES
+
+   Multiple streamers can have active dares
+   at the same time.
+
+   Example:
+
+   [
+      {
+        id: "1",
+        streamer: "streamerA",
+        status: "accepted"
+      },
+
+      {
+        id: "2",
+        streamer: "streamerB",
+        status: "accepted"
+      }
+   ]
+*/
+
+const activeDares = [];
+
+
+/*
+   Completed / failed / rejected dares
+*/
+
+const dareHistory = [];
+
+
+/*
+   ID counter
+*/
 
 let dareCounter = 0;
 
@@ -41,11 +89,14 @@ app.get("/", (req, res) => {
 
     service: "Dare Backend",
 
-    queueLength:
-      dareQueue.length,
+    activeDares:
+      activeDares.length,
 
-    currentDare:
-      currentDare
+    streamers:
+      Object.keys(streamerQueues).length,
+
+    queues:
+      streamerQueues
 
   });
 
@@ -65,6 +116,10 @@ const wss =
 
   });
 
+
+/* ==========================================
+   BROADCAST
+========================================== */
 
 function broadcast(message) {
 
@@ -91,7 +146,7 @@ function broadcast(message) {
 
 
 /* ==========================================
-   SEND CURRENT STATE
+   SEND STATE TO CLIENT
 ========================================== */
 
 function sendState(socket) {
@@ -101,49 +156,20 @@ function sendState(socket) {
     JSON.stringify({
 
       type:
-        "STATE",
+        "ACTIVE_DARES_STATE",
 
-      currentDare:
-        currentDare,
+      activeDares:
+        activeDares,
 
-      queue:
-        dareQueue
+      queues:
+        streamerQueues,
+
+      history:
+        dareHistory
 
     })
 
   );
-
-
-  /*
-  ==========================================
-  ACTIVE DARE RECOVERY
-
-  If someone refreshes the homepage while
-  a dare is already accepted, immediately
-  tell the new client about it.
-  ==========================================
-  */
-
-  if (
-    currentDare &&
-    currentDare.status === "accepted"
-  ) {
-
-    socket.send(
-
-      JSON.stringify({
-
-        type:
-          "ACTIVE_DARE",
-
-        dare:
-          currentDare
-
-      })
-
-    );
-
-  }
 
 }
 
@@ -162,11 +188,55 @@ wss.on(
 
 
     /*
-    Send current queue/current dare
-    immediately after connection.
+       IMPORTANT:
+
+       When a website/controller connects,
+       immediately send the current state.
+
+       This means refreshing the homepage
+       does NOT destroy the live dare list.
     */
 
     sendState(socket);
+
+
+    socket.on(
+      "message",
+      (message) => {
+
+        try {
+
+          const data =
+            JSON.parse(message);
+
+
+          /*
+             Client can explicitly request
+             the current state.
+          */
+
+          if (
+            data.type ===
+            "GET_ACTIVE_DARES"
+          ) {
+
+            sendState(socket);
+
+          }
+
+        }
+
+        catch (error) {
+
+          console.error(
+            "Invalid WebSocket message:",
+            error
+          );
+
+        }
+
+      }
+    );
 
 
     socket.on(
@@ -185,20 +255,55 @@ wss.on(
 
 
 /* ==========================================
-   MOVE NEXT DARE INTO CURRENT
+   CREATE STREAMER QUEUE
 ========================================== */
 
-function processNextDare() {
+function ensureStreamerQueue(streamer) {
 
-  if (currentDare) {
+  if (
+    !streamerQueues[streamer]
+  ) {
 
-    return;
+    streamerQueues[streamer] = [];
 
   }
 
+}
+
+
+/* ==========================================
+   GET ACTIVE DARE FOR STREAMER
+========================================== */
+
+function getActiveDareForStreamer(streamer) {
+
+  return activeDares.find(
+    (dare) =>
+      dare.streamer === streamer
+  );
+
+}
+
+
+/* ==========================================
+   PROCESS NEXT DARE
+========================================== */
+
+function processNextDare(streamer) {
+
+  ensureStreamerQueue(streamer);
+
+
+  /*
+     A streamer can only have ONE
+     currently running dare.
+
+     Other streamers can simultaneously
+     have their own active dare.
+  */
 
   if (
-    dareQueue.length === 0
+    getActiveDareForStreamer(streamer)
   ) {
 
     return;
@@ -206,13 +311,34 @@ function processNextDare() {
   }
 
 
-  currentDare =
-    dareQueue.shift();
+  if (
+    streamerQueues[streamer].length === 0
+  ) {
+
+    return;
+
+  }
+
+
+  const dare =
+    streamerQueues[streamer].shift();
+
+
+  /*
+     The dare is now waiting for
+     streamer acceptance.
+
+     It is NOT added to activeDares yet.
+  */
+
+  dare.status =
+    "pending";
 
 
   console.log(
-    "Now processing dare:",
-    currentDare
+    "New dare ready for streamer:",
+    streamer,
+    dare
   );
 
 
@@ -222,10 +348,13 @@ function processNextDare() {
       "NEW_DARE",
 
     dare:
-      currentDare,
+      dare,
 
     queue:
-      dareQueue
+      streamerQueues[streamer],
+
+    streamer:
+      streamer
 
   });
 
@@ -267,7 +396,7 @@ app.post(
       return res.status(400).json({
 
         error:
-          "Streamer username is required."
+          "Streamer is required."
 
       });
 
@@ -289,6 +418,62 @@ app.post(
     }
 
 
+    const cleanStreamer =
+      streamer.trim()
+        .replace(/^@/, "")
+        .toLowerCase();
+
+
+    const cleanViewer =
+      viewer &&
+      viewer.trim()
+
+        ? viewer.trim()
+
+        : "Anonymous";
+
+
+    const cleanText =
+      text.trim();
+
+
+    const cleanDuration =
+      Number(duration) || 30;
+
+
+    const cleanReward =
+      Number(reward) || 0;
+
+
+    if (
+      cleanDuration < 5 ||
+      cleanDuration > 300
+    ) {
+
+      return res.status(400).json({
+
+        error:
+          "Duration must be between 5 and 300 seconds."
+
+      });
+
+    }
+
+
+    if (
+      cleanReward < 0
+    ) {
+
+      return res.status(400).json({
+
+        error:
+          "Reward cannot be negative."
+
+      });
+
+    }
+
+
     /* =========================
        CREATE DARE
     ========================= */
@@ -301,56 +486,23 @@ app.post(
       id:
         String(dareCounter),
 
-
-      /*
-      Twitch streamer username
-      */
-
       streamer:
-        streamer.trim(),
-
-
-      /*
-      Viewer name
-      */
+        cleanStreamer,
 
       viewer:
-        viewer
-          ? viewer.trim()
-          : "Anonymous",
-
-
-      /*
-      Dare text
-      */
+        cleanViewer,
 
       text:
-        text.trim(),
-
-
-      /*
-      Duration
-      */
+        cleanText,
 
       duration:
-        Number(duration) || 30,
-
-
-      /*
-      Reward
-      */
+        cleanDuration,
 
       reward:
-        Number(reward) || 0,
-
-
-      /*
-      Initial status
-      */
+        cleanReward,
 
       status:
         "pending",
-
 
       createdAt:
         new Date().toISOString()
@@ -358,41 +510,61 @@ app.post(
     };
 
 
-    dareQueue.push(dare);
+    /* =========================
+       ADD TO STREAMER QUEUE
+    ========================= */
+
+    ensureStreamerQueue(
+      cleanStreamer
+    );
+
+
+    streamerQueues[
+      cleanStreamer
+    ].push(dare);
 
 
     console.log(
-      "Dare added to queue:",
+      "Dare added:",
       dare
     );
 
 
-    /*
-    Process queue if no dare
-    is currently active.
-    */
+    /* =========================
+       PROCESS STREAMER QUEUE
+    ========================= */
 
-    processNextDare();
+    processNextDare(
+      cleanStreamer
+    );
 
 
-    /*
-    Tell connected clients that
-    the queue changed.
-    */
+    /* =========================
+       BROADCAST
+    ========================= */
 
     broadcast({
 
       type:
         "QUEUE_UPDATED",
 
-      queue:
-        dareQueue,
+      streamer:
+        cleanStreamer,
 
-      currentDare:
-        currentDare
+      queue:
+        streamerQueues[
+          cleanStreamer
+        ],
+
+      activeDares:
+        activeDares
 
     });
 
+
+    /* =========================
+       RESPONSE
+    ========================= */
 
     res.status(201).json({
 
@@ -403,7 +575,9 @@ app.post(
         dare,
 
       queuePosition:
-        dareQueue.length
+        streamerQueues[
+          cleanStreamer
+        ].length
 
     });
 
@@ -412,7 +586,7 @@ app.post(
 
 
 /* ==========================================
-   GET CURRENT STATE
+   GET ALL STATE
 ========================================== */
 
 app.get(
@@ -421,11 +595,14 @@ app.get(
 
     res.json({
 
-      currentDare:
-        currentDare,
+      activeDares:
+        activeDares,
 
-      queue:
-        dareQueue
+      queues:
+        streamerQueues,
+
+      history:
+        dareHistory
 
     });
 
@@ -434,7 +611,51 @@ app.get(
 
 
 /* ==========================================
-   UPDATE DARE STATUS
+   GET STREAMER STATE
+========================================== */
+
+app.get(
+  "/api/dare/streamer/:streamer",
+  (req, res) => {
+
+    const streamer =
+      req.params.streamer
+        .replace(/^@/, "")
+        .toLowerCase();
+
+
+    ensureStreamerQueue(
+      streamer
+    );
+
+
+    const activeDare =
+      getActiveDareForStreamer(
+        streamer
+      );
+
+
+    res.json({
+
+      streamer:
+        streamer,
+
+      currentDare:
+        activeDare,
+
+      queue:
+        streamerQueues[
+          streamer
+        ]
+
+    });
+
+  }
+);
+
+
+/* ==========================================
+   ACCEPT DARE
 ========================================== */
 
 app.post(
@@ -464,10 +685,6 @@ app.post(
     ];
 
 
-    /* =========================
-       VALIDATE STATUS
-    ========================= */
-
     if (
       !allowedStatuses.includes(
         status
@@ -484,25 +701,91 @@ app.post(
     }
 
 
-    /* =========================
-       CHECK CURRENT DARE
-    ========================= */
+    /*
+       Search the streamer queues
+       for the dare.
 
-    if (!currentDare) {
+       This is necessary because pending
+       dares are stored in streamer queues.
+    */
 
-      return res.status(404).json({
+    let dare = null;
 
-        error:
-          "No active dare."
+    let streamer = null;
 
-      });
+
+    for (
+      const streamerName
+      of Object.keys(streamerQueues)
+    ) {
+
+      const queue =
+        streamerQueues[
+          streamerName
+        ];
+
+
+      const index =
+        queue.findIndex(
+          (item) =>
+            item.id === id
+        );
+
+
+      if (
+        index !== -1
+      ) {
+
+        dare =
+          queue[index];
+
+
+        streamer =
+          streamerName;
+
+
+        /*
+           Remove from queue.
+        */
+
+        queue.splice(
+          index,
+          1
+        );
+
+
+        break;
+
+      }
 
     }
 
 
-    if (
-      currentDare.id !== id
-    ) {
+    /*
+       If not found in queue,
+       check active dares.
+    */
+
+    if (!dare) {
+
+      dare =
+        activeDares.find(
+          (item) =>
+            item.id === id
+        );
+
+
+      if (dare) {
+
+        streamer =
+          dare.streamer;
+
+      }
+
+    }
+
+
+    if (!dare) {
 
       return res.status(404).json({
 
@@ -514,58 +797,67 @@ app.post(
     }
 
 
-    /* =========================
-       UPDATE STATUS
-    ========================= */
-
-    currentDare.status =
-      status;
-
-
-    currentDare.updatedAt =
-      new Date().toISOString();
-
-
-    console.log(
-      "Dare status changed:",
-      currentDare
-    );
-
-
-    /* =========================
-       BROADCAST STATUS
-    ========================= */
-
-    broadcast({
-
-      type:
-        "DARE_STATUS",
-
-      dare:
-        currentDare,
-
-      queue:
-        dareQueue
-
-    });
-
-
-    /* =====================================
+    /* ========================================
        ACCEPTED
-       
-       This is what activates the
-       LIVE DARE Twitch section.
-    ===================================== */
+    ======================================== */
 
     if (
       status === "accepted"
     ) {
 
-      console.log(
-        "ACTIVE DARE:",
-        currentDare
+      /*
+         Prevent multiple active dares
+         for the same streamer.
+      */
+
+      if (
+        getActiveDareForStreamer(
+          streamer
+        )
+      ) {
+
+        /*
+           Put dare back in queue.
+        */
+
+        streamerQueues[
+          streamer
+        ].unshift(dare);
+
+
+        return res.status(409).json({
+
+          error:
+            "This streamer already has an active dare."
+
+        });
+
+      }
+
+
+      dare.status =
+        "accepted";
+
+
+      dare.acceptedAt =
+        new Date().toISOString();
+
+
+      activeDares.push(
+        dare
       );
 
+
+      console.log(
+        "DARE ACCEPTED:",
+        dare
+      );
+
+
+      /*
+         THIS IS THE EVENT THE HOMEPAGE
+         WILL USE TO SHOW THE TWITCH STREAM.
+      */
 
       broadcast({
 
@@ -573,140 +865,322 @@ app.post(
           "ACTIVE_DARE",
 
         dare:
-          currentDare
+          dare,
+
+        activeDares:
+          activeDares
 
       });
 
-    }
-
-
-    /* =====================================
-       FINISHED DARE
-    ===================================== */
-
-    if (
-
-      status === "completed" ||
-
-      status === "failed" ||
-
-      status === "rejected"
-
-    ) {
-
 
       /*
-      Tell the website immediately
-      that the active dare is ending.
+         Also tell controllers
+         that the queue changed.
       */
 
       broadcast({
 
         type:
-          "DARE_ENDED",
+          "QUEUE_UPDATED",
 
-        status:
-          status,
+        streamer:
+          streamer,
+
+        queue:
+          streamerQueues[
+            streamer
+          ],
+
+        activeDares:
+          activeDares
+
+      });
+
+
+      return res.json({
+
+        success:
+          true,
 
         dare:
-          currentDare
+          dare,
+
+        activeDares:
+          activeDares
+
+      });
+
+    }
+
+
+    /* ========================================
+       REJECTED
+    ======================================== */
+
+    if (
+      status === "rejected"
+    ) {
+
+      dare.status =
+        "rejected";
+
+
+      dare.updatedAt =
+        new Date().toISOString();
+
+
+      dareHistory.push(
+        dare
+      );
+
+
+      console.log(
+        "DARE REJECTED:",
+        dare
+      );
+
+
+      broadcast({
+
+        type:
+          "DARE_REJECTED",
+
+        dare:
+          dare,
+
+        activeDares:
+          activeDares
 
       });
 
 
       /*
-      Wait briefly so the controller
-      and overlay can display the
-      final result.
+         Move to next dare
+         for this streamer.
       */
 
-      setTimeout(
-        () => {
-
-          /*
-          Only clear if this is
-          still the same dare.
-          */
-
-          if (
-
-            currentDare &&
-
-            currentDare.id === id
-
-          ) {
-
-            currentDare =
-              null;
-
-
-            /*
-            Tell all connected
-            clients the active
-            dare is gone.
-            */
-
-            broadcast({
-
-              type:
-                "DARE_CLEARED",
-
-              queue:
-                dareQueue
-
-            });
-
-
-            /*
-            Automatically process
-            the next queued dare.
-            */
-
-            processNextDare();
-
-
-            /*
-            Update queue state.
-            */
-
-            broadcast({
-
-              type:
-                "QUEUE_UPDATED",
-
-              queue:
-                dareQueue,
-
-              currentDare:
-                currentDare
-
-            });
-
-          }
-
-        },
-
-        1500
-
+      processNextDare(
+        streamer
       );
+
+
+      broadcast({
+
+        type:
+          "QUEUE_UPDATED",
+
+        streamer:
+          streamer,
+
+        queue:
+          streamerQueues[
+            streamer
+          ],
+
+        activeDares:
+          activeDares
+
+      });
+
+
+      return res.json({
+
+        success:
+          true,
+
+        dare:
+          dare,
+
+        activeDares:
+          activeDares
+
+      });
 
     }
 
 
-    /* =========================
-       RESPONSE
-    ========================= */
+    /* ========================================
+       COMPLETED / FAILED
+    ======================================== */
+
+    if (
+
+      status === "completed" ||
+
+      status === "failed"
+
+    ) {
+
+      /*
+         Find the active dare.
+      */
+
+      const activeIndex =
+        activeDares.findIndex(
+          (item) =>
+            item.id === id
+        );
+
+
+      if (
+        activeIndex === -1
+      ) {
+
+        return res.status(404).json({
+
+          error:
+            "Active dare not found."
+
+        });
+
+      }
+
+
+      const activeDare =
+        activeDares[
+          activeIndex
+        ];
+
+
+      activeDare.status =
+        status;
+
+
+      activeDare.updatedAt =
+        new Date().toISOString();
+
+
+      activeDare.completedAt =
+        new Date().toISOString();
+
+
+      /*
+         Save to history.
+      */
+
+      dareHistory.push(
+        activeDare
+      );
+
+
+      /*
+         Remove from active list.
+      */
+
+      activeDares.splice(
+        activeIndex,
+        1
+      );
+
+
+      console.log(
+        "DARE FINISHED:",
+        activeDare
+      );
+
+
+      /*
+         Tell homepage to remove
+         Twitch stream.
+      */
+
+      broadcast({
+
+        type:
+          status === "completed"
+
+            ? "DARE_COMPLETED"
+
+            : "DARE_FAILED",
+
+        dare:
+          activeDare,
+
+        activeDares:
+          activeDares
+
+      });
+
+
+      /*
+         Process next dare
+         for this streamer.
+      */
+
+      processNextDare(
+        streamer
+      );
+
+
+      broadcast({
+
+        type:
+          "QUEUE_UPDATED",
+
+        streamer:
+          streamer,
+
+        queue:
+          streamerQueues[
+            streamer
+          ],
+
+        activeDares:
+          activeDares
+
+      });
+
+
+      return res.json({
+
+        success:
+          true,
+
+        dare:
+          activeDare,
+
+        activeDares:
+          activeDares
+
+      });
+
+    }
+
+  }
+);
+
+
+/* ==========================================
+   GET ACTIVE DARES
+========================================== */
+
+app.get(
+  "/api/active-dares",
+  (req, res) => {
 
     res.json({
 
-      success:
-        true,
+      activeDares:
+        activeDares
 
-      dare:
-        currentDare,
+    });
 
-      queue:
-        dareQueue
+  }
+);
+
+
+/* ==========================================
+   GET DARE HISTORY
+========================================== */
+
+app.get(
+  "/api/dare/history",
+  (req, res) => {
+
+    res.json({
+
+      history:
+        dareHistory
 
     });
 
@@ -722,16 +1196,47 @@ app.post(
   "/api/dare/clear",
   (req, res) => {
 
-    dareQueue.length = 0;
+    /*
+       Clear queues.
+    */
 
-    currentDare =
-      null;
+    Object.keys(
+      streamerQueues
+    ).forEach(
+      (streamer) => {
+
+        streamerQueues[
+          streamer
+        ] = [];
+
+      }
+    );
+
+
+    /*
+       Clear active dares.
+    */
+
+    activeDares.length = 0;
+
+
+    /*
+       Clear history.
+    */
+
+    dareHistory.length = 0;
 
 
     broadcast({
 
       type:
-        "RESET"
+        "RESET",
+
+      activeDares:
+        [],
+
+      queues:
+        {}
 
     });
 
