@@ -9,15 +9,12 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3000;
 
-
 /* =========================================================
    MIDDLEWARE
 ========================================================= */
 
 app.use(cors());
-
 app.use(express.json());
-
 
 /* =========================================================
    DATABASE
@@ -30,12 +27,10 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-
     ssl: {
         rejectUnauthorized: false
     }
 });
-
 
 /* =========================================================
    WEBSOCKET
@@ -45,7 +40,6 @@ const wss = new WebSocket.Server({
     server: server,
     path: "/ws"
 });
-
 
 /* =========================================================
    CONNECTED CLIENTS
@@ -57,24 +51,15 @@ wss.on("connection", function(ws) {
 
     sendState(ws);
 
-
     ws.on("message", async function(rawMessage) {
 
         try {
 
             const message =
-                JSON.parse(
-                    rawMessage.toString()
-                );
+                JSON.parse(rawMessage.toString());
 
-
-            if (
-                message.type ===
-                "GET_STATE"
-            ) {
-
+            if (message.type === "GET_STATE") {
                 await sendState(ws);
-
             }
 
         } catch (error) {
@@ -88,7 +73,6 @@ wss.on("connection", function(ws) {
 
     });
 
-
     ws.on("close", function() {
 
         console.log(
@@ -96,7 +80,6 @@ wss.on("connection", function(ws) {
         );
 
     });
-
 
     ws.on("error", function(error) {
 
@@ -109,7 +92,6 @@ wss.on("connection", function(ws) {
 
 });
 
-
 /* =========================================================
    WEBSOCKET HELPERS
 ========================================================= */
@@ -117,41 +99,30 @@ wss.on("connection", function(ws) {
 function broadcast(message) {
 
     const data =
-        JSON.stringify(
-            message
-        );
+        JSON.stringify(message);
 
+    wss.clients.forEach(client => {
 
-    wss.clients.forEach(
-        client => {
+        if (client.readyState === WebSocket.OPEN) {
 
-            if (
-                client.readyState ===
-                WebSocket.OPEN
-            ) {
+            try {
 
-                try {
+                client.send(data);
 
-                    client.send(
-                        data
-                    );
+            } catch (error) {
 
-                } catch (error) {
-
-                    console.error(
-                        "WebSocket send error:",
-                        error
-                    );
-
-                }
+                console.error(
+                    "WebSocket send error:",
+                    error
+                );
 
             }
 
         }
-    );
+
+    });
 
 }
-
 
 /* =========================================================
    FORMAT DARE
@@ -162,7 +133,6 @@ function formatDare(row) {
     if (!row) {
         return null;
     }
-
 
     return {
 
@@ -203,7 +173,6 @@ function formatDare(row) {
 
 }
 
-
 /* =========================================================
    GET ACTIVE DARES
 ========================================================= */
@@ -223,32 +192,23 @@ async function getActiveDaresFromDatabase() {
 
         `);
 
-
     const active = {};
 
+    result.rows.forEach(row => {
 
-    result.rows.forEach(
-        row => {
-
-            const key =
-                String(
-                    row.streamer
-                )
+        const key =
+            String(row.streamer)
                 .trim()
                 .toLowerCase();
 
+        active[key] =
+            formatDare(row);
 
-            active[key] =
-                formatDare(row);
-
-        }
-    );
-
+    });
 
     return active;
 
 }
-
 
 /* =========================================================
    GET QUEUES
@@ -269,40 +229,28 @@ async function getAllQueuesFromDatabase() {
 
         `);
 
-
     const queues = {};
 
+    result.rows.forEach(row => {
 
-    result.rows.forEach(
-        row => {
-
-            const key =
-                String(
-                    row.streamer
-                )
+        const key =
+            String(row.streamer)
                 .trim()
                 .toLowerCase();
 
-
-            if (!queues[key]) {
-
-                queues[key] = [];
-
-            }
-
-
-            queues[key].push(
-                formatDare(row)
-            );
-
+        if (!queues[key]) {
+            queues[key] = [];
         }
-    );
 
+        queues[key].push(
+            formatDare(row)
+        );
+
+    });
 
     return queues;
 
 }
-
 
 /* =========================================================
    SEND STATE
@@ -315,15 +263,10 @@ async function sendState(ws) {
         const active =
             await getActiveDaresFromDatabase();
 
-
         const queues =
             await getAllQueuesFromDatabase();
 
-
-        if (
-            ws.readyState ===
-            WebSocket.OPEN
-        ) {
+        if (ws.readyState === WebSocket.OPEN) {
 
             ws.send(
                 JSON.stringify({
@@ -353,14 +296,11 @@ async function sendState(ws) {
 
 }
 
-
 /* =========================================================
    GET ACTIVE DARE FOR STREAMER
 ========================================================= */
 
-async function getActiveDareForStreamer(
-    streamer
-) {
+async function getActiveDareForStreamer(streamer) {
 
     const result =
         await pool.query(
@@ -372,7 +312,7 @@ async function getActiveDareForStreamer(
             FROM dares
 
             WHERE LOWER(TRIM(streamer))
-                = LOWER(TRIM($1))
+                = LOWER(TRIM($1::VARCHAR))
 
             AND status = 'accepted'
 
@@ -386,13 +326,9 @@ async function getActiveDareForStreamer(
 
         );
 
-
     if (!result.rows.length) {
-
         return null;
-
     }
-
 
     return formatDare(
         result.rows[0]
@@ -400,14 +336,11 @@ async function getActiveDareForStreamer(
 
 }
 
-
 /* =========================================================
    GET STREAMER QUEUE
 ========================================================= */
 
-async function getStreamerQueue(
-    streamer
-) {
+async function getStreamerQueue(streamer) {
 
     const result =
         await pool.query(
@@ -419,7 +352,7 @@ async function getStreamerQueue(
             FROM dares
 
             WHERE LOWER(TRIM(streamer))
-                = LOWER(TRIM($1))
+                = LOWER(TRIM($1::VARCHAR))
 
             AND status = 'pending'
 
@@ -431,13 +364,11 @@ async function getStreamerQueue(
 
         );
 
-
     return result.rows.map(
         formatDare
     );
 
 }
-
 
 /* =========================================================
    DATABASE INITIALIZATION
@@ -485,7 +416,6 @@ async function initializeDatabase() {
 
     `);
 
-
     await pool.query(`
 
         CREATE INDEX IF NOT EXISTS
@@ -498,7 +428,6 @@ async function initializeDatabase() {
 
     `);
 
-
     await pool.query(`
 
         CREATE INDEX IF NOT EXISTS
@@ -510,41 +439,35 @@ async function initializeDatabase() {
 
     `);
 
-
     console.log(
         "✅ Database initialized."
     );
 
 }
 
-
 /* =========================================================
    HEALTH CHECK
 ========================================================= */
 
-app.get(
-    "/",
-    function(req, res) {
+app.get("/", function(req, res) {
 
-        res.json({
+    res.json({
 
-            status:
-                "online",
+        status:
+            "online",
 
-            service:
-                "dare-backend",
+        service:
+            "dare-backend",
 
-            websocket:
-                "/ws",
+        websocket:
+            "/ws",
 
-            time:
-                new Date().toISOString()
+        time:
+            new Date().toISOString()
 
-        });
+    });
 
-    }
-);
-
+});
 
 /* =========================================================
    STREAMERS
@@ -567,7 +490,6 @@ const connectedStreamers = [
 
 ];
 
-
 app.get(
     "/api/streamers",
     function(req, res) {
@@ -579,14 +501,11 @@ app.get(
     }
 );
 
-
 /* =========================================================
    CREATE DARE
 =========================================================
 
-   NEW BEHAVIOR:
-
-   If streamer has NO active dare:
+   NO ACTIVE DARE:
 
        submission
           ↓
@@ -596,7 +515,7 @@ app.get(
           ↓
        OVERLAY
 
-   If streamer ALREADY has active dare:
+   ACTIVE DARE EXISTS:
 
        submission
           ↓
@@ -626,7 +545,6 @@ app.post(
 
         } = req.body;
 
-
         /* -------------------------------------------------
            VALIDATION
         ------------------------------------------------- */
@@ -645,7 +563,6 @@ app.post(
 
         }
 
-
         if (
             !dare_text ||
             typeof dare_text !== "string"
@@ -660,10 +577,8 @@ app.post(
 
         }
 
-
         const cleanDareText =
             dare_text.trim();
-
 
         if (!cleanDareText) {
 
@@ -676,15 +591,11 @@ app.post(
 
         }
 
-
         const durationNumber =
             Number(duration);
 
-
         if (
-            !Number.isFinite(
-                durationNumber
-            ) ||
+            !Number.isFinite(durationNumber) ||
             durationNumber < 5 ||
             durationNumber > 300
         ) {
@@ -698,15 +609,11 @@ app.post(
 
         }
 
-
         const rewardNumber =
             Number(reward || 0);
 
-
         if (
-            !Number.isFinite(
-                rewardNumber
-            ) ||
+            !Number.isFinite(rewardNumber) ||
             rewardNumber < 0
         ) {
 
@@ -719,18 +626,14 @@ app.post(
 
         }
 
-
         const cleanStreamer =
             streamer.trim();
 
-
         const cleanViewer =
             String(
-                viewer ||
-                "Anonymous"
+                viewer || "Anonymous"
             ).trim() ||
             "Anonymous";
-
 
         const cleanSource =
             String(
@@ -738,10 +641,8 @@ app.post(
                 "twitch_username"
             ).trim();
 
-
         const client =
             await pool.connect();
-
 
         try {
 
@@ -749,32 +650,30 @@ app.post(
                 "BEGIN"
             );
 
-
-            /*
-             * IMPORTANT:
-             *
-             * Lock this streamer's transaction
-             * so two simultaneous submissions
-             * cannot both become active.
-             */
+            /* -------------------------------------------------
+               LOCK STREAMER
+            ------------------------------------------------- */
 
             await client.query(
+
                 `
+
                 SELECT
                     pg_advisory_xact_lock(
                         hashtext(
-                            LOWER(TRIM($1))
+                            LOWER(TRIM($1::VARCHAR))
                         )
                     )
+
                 `,
+
                 [cleanStreamer]
+
             );
 
-
-            /*
-             * Check whether this streamer
-             * already has an active dare.
-             */
+            /* -------------------------------------------------
+               CHECK ACTIVE DARE
+            ------------------------------------------------- */
 
             const activeResult =
                 await client.query(
@@ -786,7 +685,7 @@ app.post(
                     FROM dares
 
                     WHERE LOWER(TRIM(streamer))
-                        = LOWER(TRIM($1))
+                        = LOWER(TRIM($1::VARCHAR))
 
                     AND status = 'accepted'
 
@@ -798,24 +697,32 @@ app.post(
 
                 );
 
-
             const hasActiveDare =
                 activeResult.rows.length > 0;
 
-
-            /*
-             * Decide status BEFORE inserting.
-             */
+            /* -------------------------------------------------
+               DETERMINE STATUS
+            ------------------------------------------------- */
 
             const newStatus =
                 hasActiveDare
                     ? "pending"
                     : "accepted";
 
+            /* -------------------------------------------------
+               INSERT DARE
 
-            /*
-             * Insert the dare.
-             */
+               IMPORTANT FIX:
+               Every parameter has an explicit PostgreSQL type.
+
+               $1 = VARCHAR
+               $2 = VARCHAR
+               $3 = VARCHAR
+               $4 = TEXT
+               $5 = INTEGER
+               $6 = NUMERIC
+               $7 = VARCHAR
+            ------------------------------------------------- */
 
             const insertResult =
                 await client.query(
@@ -846,16 +753,16 @@ app.post(
 
                     VALUES (
 
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
+                        $1::VARCHAR,
+                        $2::VARCHAR,
+                        $3::VARCHAR,
+                        $4::TEXT,
+                        $5::INTEGER,
+                        $6::NUMERIC,
+                        $7::VARCHAR,
 
                         CASE
-                            WHEN $7 = 'accepted'
+                            WHEN $7::VARCHAR = 'accepted'
                             THEN NOW()
                             ELSE NULL
                         END,
@@ -890,43 +797,27 @@ app.post(
 
                 );
 
-
             const dare =
                 formatDare(
                     insertResult.rows[0]
                 );
 
-
             await client.query(
                 "COMMIT"
             );
-
 
             /* -------------------------------------------------
                IMMEDIATELY ACTIVE
             ------------------------------------------------- */
 
             if (
-                newStatus ===
-                "accepted"
+                newStatus === "accepted"
             ) {
 
                 console.log(
                     "🔥 DARE IMMEDIATELY ACTIVE:",
                     dare
                 );
-
-
-                /*
-                 * Send ACTIVE_DARE directly.
-                 *
-                 * We intentionally do NOT send
-                 * DARE_CREATED here because your
-                 * controller previously tried to
-                 * accept DARE_CREATED itself.
-                 *
-                 * This prevents duplicate activation.
-                 */
 
                 broadcast({
 
@@ -937,7 +828,6 @@ app.post(
                         dare
 
                 });
-
 
                 return res.status(201).json({
 
@@ -954,7 +844,6 @@ app.post(
 
             }
 
-
             /* -------------------------------------------------
                PENDING
             ------------------------------------------------- */
@@ -964,17 +853,10 @@ app.post(
                 dare
             );
 
-
-            /*
-             * Tell clients about the new
-             * pending queue state.
-             */
-
             const queue =
                 await getStreamerQueue(
                     cleanStreamer
                 );
-
 
             broadcast({
 
@@ -989,7 +871,6 @@ app.post(
 
             });
 
-
             return res.status(201).json({
 
                 success:
@@ -1003,7 +884,6 @@ app.post(
 
             });
 
-
         } catch (error) {
 
             try {
@@ -1014,12 +894,10 @@ app.post(
 
             } catch (_) {}
 
-
             console.error(
                 "❌ CREATE DARE ERROR:",
                 error
             );
-
 
             return res.status(500).json({
 
@@ -1037,7 +915,6 @@ app.post(
     }
 );
 
-
 /* =========================================================
    GET ALL DARE STATE
 ========================================================= */
@@ -1051,10 +928,8 @@ app.get(
             const active =
                 await getActiveDaresFromDatabase();
 
-
             const queues =
                 await getAllQueuesFromDatabase();
-
 
             res.json({
 
@@ -1072,7 +947,6 @@ app.get(
                 error
             );
 
-
             res.status(500).json({
 
                 error:
@@ -1084,7 +958,6 @@ app.get(
 
     }
 );
-
 
 /* =========================================================
    GET STREAMER QUEUE
@@ -1101,7 +974,6 @@ app.get(
                     req.params.streamer
                 );
 
-
             res.json(
                 queue
             );
@@ -1111,7 +983,6 @@ app.get(
             console.error(
                 error
             );
-
 
             res.status(500).json({
 
@@ -1124,7 +995,6 @@ app.get(
 
     }
 );
-
 
 /* =========================================================
    GET ACTIVE DARE
@@ -1141,7 +1011,6 @@ app.get(
                     req.params.streamer
                 );
 
-
             res.json(
                 dare
             );
@@ -1151,7 +1020,6 @@ app.get(
             console.error(
                 error
             );
-
 
             res.status(500).json({
 
@@ -1164,7 +1032,6 @@ app.get(
 
     }
 );
-
 
 /* =========================================================
    UPDATE DARE STATUS
@@ -1179,30 +1046,21 @@ app.post(
                 req.params.id
             );
 
-
         const status =
             String(
-                req.body.status ||
-                ""
+                req.body.status || ""
             ).trim().toLowerCase();
-
 
         const allowedStatuses = [
 
             "accepted",
-
             "rejected",
-
             "completed",
-
             "failed"
 
         ];
 
-
-        if (
-            !Number.isInteger(id)
-        ) {
+        if (!Number.isInteger(id)) {
 
             return res.status(400).json({
 
@@ -1213,11 +1071,8 @@ app.post(
 
         }
 
-
         if (
-            !allowedStatuses.includes(
-                status
-            )
+            !allowedStatuses.includes(status)
         ) {
 
             return res.status(400).json({
@@ -1229,10 +1084,8 @@ app.post(
 
         }
 
-
         const client =
             await pool.connect();
-
 
         try {
 
@@ -1240,10 +1093,9 @@ app.post(
                 "BEGIN"
             );
 
-
-            /*
-             * Lock the dare row.
-             */
+            /* -------------------------------------------------
+               LOCK DARE
+            ------------------------------------------------- */
 
             const dareResult =
                 await client.query(
@@ -1254,7 +1106,7 @@ app.post(
 
                     FROM dares
 
-                    WHERE id = $1
+                    WHERE id = $1::INTEGER
 
                     FOR UPDATE
 
@@ -1264,15 +1116,11 @@ app.post(
 
                 );
 
-
-            if (
-                !dareResult.rows.length
-            ) {
+            if (!dareResult.rows.length) {
 
                 await client.query(
                     "ROLLBACK"
                 );
-
 
                 return res.status(404).json({
 
@@ -1283,28 +1131,17 @@ app.post(
 
             }
 
-
             const existing =
                 dareResult.rows[0];
 
-
             const streamer =
                 existing.streamer;
-
 
             /* -------------------------------------------------
                ACCEPT
             ------------------------------------------------- */
 
-            if (
-                status ===
-                "accepted"
-            ) {
-
-                /*
-                 * Check if another dare
-                 * is already active.
-                 */
+            if (status === "accepted") {
 
                 const activeResult =
                     await client.query(
@@ -1316,11 +1153,11 @@ app.post(
                         FROM dares
 
                         WHERE LOWER(TRIM(streamer))
-                            = LOWER(TRIM($1))
+                            = LOWER(TRIM($1::VARCHAR))
 
                         AND status = 'accepted'
 
-                        AND id <> $2
+                        AND id <> $2::INTEGER
 
                         LIMIT 1
 
@@ -1333,15 +1170,11 @@ app.post(
 
                     );
 
-
-                if (
-                    activeResult.rows.length
-                ) {
+                if (activeResult.rows.length) {
 
                     await client.query(
                         "ROLLBACK"
                     );
-
 
                     return res.status(409).json({
 
@@ -1351,7 +1184,6 @@ app.post(
                     });
 
                 }
-
 
                 const result =
                     await client.query(
@@ -1373,7 +1205,7 @@ app.post(
                             updated_at =
                                 NOW()
 
-                        WHERE id = $1
+                        WHERE id = $1::INTEGER
 
                         RETURNING *
 
@@ -1383,17 +1215,14 @@ app.post(
 
                     );
 
-
                 const dare =
                     formatDare(
                         result.rows[0]
                     );
 
-
                 await client.query(
                     "COMMIT"
                 );
-
 
                 broadcast({
 
@@ -1404,7 +1233,6 @@ app.post(
                         dare
 
                 });
-
 
                 return res.json({
 
@@ -1418,15 +1246,11 @@ app.post(
 
             }
 
-
             /* -------------------------------------------------
                REJECT
             ------------------------------------------------- */
 
-            if (
-                status ===
-                "rejected"
-            ) {
+            if (status === "rejected") {
 
                 const result =
                     await client.query(
@@ -1442,7 +1266,7 @@ app.post(
                             updated_at =
                                 NOW()
 
-                        WHERE id = $1
+                        WHERE id = $1::INTEGER
 
                         RETURNING *
 
@@ -1452,23 +1276,19 @@ app.post(
 
                     );
 
-
                 const dare =
                     formatDare(
                         result.rows[0]
                     );
 
-
                 await client.query(
                     "COMMIT"
                 );
-
 
                 const queue =
                     await getStreamerQueue(
                         streamer
                     );
-
 
                 broadcast({
 
@@ -1479,7 +1299,6 @@ app.post(
                         dare
 
                 });
-
 
                 broadcast({
 
@@ -1494,7 +1313,6 @@ app.post(
 
                 });
 
-
                 return res.json({
 
                     success:
@@ -1507,32 +1325,22 @@ app.post(
 
             }
 
-
             /* -------------------------------------------------
                COMPLETED / FAILED
             ------------------------------------------------- */
 
             if (
-                status ===
-                "completed" ||
-                status ===
-                "failed"
+                status === "completed" ||
+                status === "failed"
             ) {
 
-                /*
-                 * Only allow completion/failure
-                 * of an active dare.
-                 */
-
                 if (
-                    existing.status !==
-                    "accepted"
+                    existing.status !== "accepted"
                 ) {
 
                     await client.query(
                         "ROLLBACK"
                     );
-
 
                     return res.status(409).json({
 
@@ -1543,7 +1351,6 @@ app.post(
 
                 }
 
-
                 const result =
                     await client.query(
 
@@ -1553,12 +1360,12 @@ app.post(
 
                         SET
 
-                            status = $1,
+                            status = $1::VARCHAR,
 
                             updated_at =
                                 NOW()
 
-                        WHERE id = $2
+                        WHERE id = $2::INTEGER
 
                         RETURNING *
 
@@ -1571,22 +1378,16 @@ app.post(
 
                     );
 
-
                 const dare =
                     formatDare(
                         result.rows[0]
                     );
 
-
                 await client.query(
                     "COMMIT"
                 );
 
-
-                if (
-                    status ===
-                    "completed"
-                ) {
+                if (status === "completed") {
 
                     broadcast({
 
@@ -1612,7 +1413,6 @@ app.post(
 
                 }
 
-
                 broadcast({
 
                     type:
@@ -1623,21 +1423,10 @@ app.post(
 
                 });
 
-
-                /*
-                 * IMPORTANT:
-                 *
-                 * We do NOT automatically
-                 * activate the next queued dare.
-                 *
-                 * It stays pending.
-                 */
-
                 const queue =
                     await getStreamerQueue(
                         streamer
                     );
-
 
                 broadcast({
 
@@ -1651,7 +1440,6 @@ app.post(
                         queue
 
                 });
-
 
                 return res.json({
 
@@ -1668,7 +1456,6 @@ app.post(
 
             }
 
-
         } catch (error) {
 
             try {
@@ -1679,12 +1466,10 @@ app.post(
 
             } catch (_) {}
 
-
             console.error(
                 "❌ STATUS UPDATE ERROR:",
                 error
             );
-
 
             return res.status(500).json({
 
@@ -1702,7 +1487,6 @@ app.post(
     }
 );
 
-
 /* =========================================================
    HISTORY
 ========================================================= */
@@ -1716,12 +1500,10 @@ app.get(
             const limit =
                 Math.min(
                     Number(
-                        req.query.limit ||
-                        100
+                        req.query.limit || 100
                     ),
                     500
                 );
-
 
             const result =
                 await pool.query(
@@ -1734,14 +1516,13 @@ app.get(
 
                     ORDER BY created_at DESC
 
-                    LIMIT $1
+                    LIMIT $1::INTEGER
 
                     `,
 
                     [limit]
 
                 );
-
 
             res.json(
                 result.rows.map(
@@ -1755,7 +1536,6 @@ app.get(
                 error
             );
 
-
             res.status(500).json({
 
                 error:
@@ -1767,7 +1547,6 @@ app.get(
 
     }
 );
-
 
 /* =========================================================
    CLEAR ALL DARES
@@ -1783,14 +1562,12 @@ app.post(
                 "DELETE FROM dares"
             );
 
-
             broadcast({
 
                 type:
                     "RESET"
 
             });
-
 
             res.json({
 
@@ -1808,7 +1585,6 @@ app.post(
                 error
             );
 
-
             res.status(500).json({
 
                 error:
@@ -1821,7 +1597,6 @@ app.post(
     }
 );
 
-
 /* =========================================================
    START SERVER
 ========================================================= */
@@ -1831,7 +1606,6 @@ async function startServer() {
     try {
 
         await initializeDatabase();
-
 
         server.listen(
             PORT,
@@ -1879,6 +1653,5 @@ async function startServer() {
     }
 
 }
-
 
 startServer();
