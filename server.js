@@ -105,8 +105,8 @@ async function initializeDatabase() {
 
 const connectedStreamers = [
   {
-    username: "YourTwitchUsername",
-    displayName: "YourTwitchUsername",
+    username: "IShowSloow_",
+    displayName: "IShowSloow_",
     connected: true
   }
 ];
