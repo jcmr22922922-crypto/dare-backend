@@ -9,83 +9,32 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3000;
 
+
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
+
 app.use(cors());
+
 app.use(express.json());
+
 
 /* =========================================================
    DATABASE
 ========================================================= */
 
 if (!process.env.DATABASE_URL) {
-  console.error("DATABASE_URL is missing.");
-  process.exit(1);
+    console.error("❌ DATABASE_URL is missing.");
+    process.exit(1);
 }
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+    connectionString: process.env.DATABASE_URL,
+
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
-
-
-/* =========================================================
-   DATABASE SETUP
-========================================================= */
-
-async function initializeDatabase() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS dares (
-        id SERIAL PRIMARY KEY,
-
-        streamer VARCHAR(255) NOT NULL,
-
-        streamer_source VARCHAR(50)
-          NOT NULL DEFAULT 'twitch_username',
-
-        viewer VARCHAR(255)
-          NOT NULL DEFAULT 'Anonymous',
-
-        dare_text TEXT NOT NULL,
-
-        duration INTEGER NOT NULL,
-
-        reward NUMERIC(12,2)
-          NOT NULL DEFAULT 0,
-
-        status VARCHAR(30)
-          NOT NULL DEFAULT 'pending',
-
-        created_at TIMESTAMP WITH TIME ZONE
-          NOT NULL DEFAULT NOW(),
-
-        accepted_at TIMESTAMP WITH TIME ZONE,
-
-        updated_at TIMESTAMP WITH TIME ZONE
-      );
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_dares_streamer
-      ON dares(streamer);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_dares_status
-      ON dares(status);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_dares_created_at
-      ON dares(created_at);
-    `);
-
-    console.log("PostgreSQL initialized.");
-  } catch (error) {
-    console.error("Database initialization error:", error);
-  }
-}
 
 
 /* =========================================================
@@ -93,61 +42,115 @@ async function initializeDatabase() {
 ========================================================= */
 
 const wss = new WebSocket.Server({
-  server,
-  path: "/ws"
+    server: server,
+    path: "/ws"
 });
 
+
+/* =========================================================
+   CONNECTED CLIENTS
+========================================================= */
+
+wss.on("connection", function(ws) {
+
+    console.log("🟢 WebSocket client connected.");
+
+    sendState(ws);
+
+
+    ws.on("message", async function(rawMessage) {
+
+        try {
+
+            const message =
+                JSON.parse(
+                    rawMessage.toString()
+                );
+
+
+            if (
+                message.type ===
+                "GET_STATE"
+            ) {
+
+                await sendState(ws);
+
+            }
+
+        } catch (error) {
+
+            console.error(
+                "❌ WebSocket message error:",
+                error
+            );
+
+        }
+
+    });
+
+
+    ws.on("close", function() {
+
+        console.log(
+            "🔴 WebSocket client disconnected."
+        );
+
+    });
+
+
+    ws.on("error", function(error) {
+
+        console.error(
+            "❌ WebSocket client error:",
+            error
+        );
+
+    });
+
+});
+
+
+/* =========================================================
+   WEBSOCKET HELPERS
+========================================================= */
 
 function broadcast(message) {
-  const payload = JSON.stringify(message);
 
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
-  });
+    const data =
+        JSON.stringify(
+            message
+        );
+
+
+    wss.clients.forEach(
+        client => {
+
+            if (
+                client.readyState ===
+                WebSocket.OPEN
+            ) {
+
+                try {
+
+                    client.send(
+                        data
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "WebSocket send error:",
+                        error
+                    );
+
+                }
+
+            }
+
+        }
+    );
+
 }
-
-
-async function sendState(ws) {
-  try {
-    const state = await getCurrentState();
-
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "STATE",
-          ...state
-        })
-      );
-    }
-  } catch (error) {
-    console.error("sendState error:", error);
-  }
-}
-
-
-wss.on("connection", async (ws) => {
-  console.log("WebSocket client connected.");
-
-  await sendState(ws);
-
-  ws.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-
-      if (data.type === "GET_STATE") {
-        await sendState(ws);
-      }
-    } catch (error) {
-      console.error("WebSocket message error:", error);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("WebSocket client disconnected.");
-  });
-});
 
 
 /* =========================================================
@@ -155,63 +158,49 @@ wss.on("connection", async (ws) => {
 ========================================================= */
 
 function formatDare(row) {
-  if (!row) {
-    return null;
-  }
 
-  return {
-    id: row.id,
-
-    streamer: row.streamer,
-
-    streamerSource: row.streamer_source,
-
-    viewer: row.viewer,
-
-    dareText: row.dare_text,
-
-    duration: Number(row.duration),
-
-    reward: Number(row.reward),
-
-    status: row.status,
-
-    createdAt: row.created_at,
-
-    acceptedAt: row.accepted_at,
-
-    updatedAt: row.updated_at
-  };
-}
-
-
-/* =========================================================
-   GET ALL QUEUES
-========================================================= */
-
-async function getAllQueuesFromDatabase() {
-  const result = await pool.query(`
-    SELECT *
-    FROM dares
-    WHERE status = 'pending'
-    ORDER BY created_at ASC, id ASC
-  `);
-
-  const queues = {};
-
-  for (const row of result.rows) {
-    const streamer = row.streamer;
-
-    if (!queues[streamer]) {
-      queues[streamer] = [];
+    if (!row) {
+        return null;
     }
 
-    queues[streamer].push(
-      formatDare(row)
-    );
-  }
 
-  return queues;
+    return {
+
+        id:
+            Number(row.id),
+
+        streamer:
+            row.streamer,
+
+        streamerSource:
+            row.streamer_source,
+
+        viewer:
+            row.viewer,
+
+        dareText:
+            row.dare_text,
+
+        duration:
+            Number(row.duration),
+
+        reward:
+            Number(row.reward || 0),
+
+        status:
+            row.status,
+
+        createdAt:
+            row.created_at,
+
+        acceptedAt:
+            row.accepted_at,
+
+        updatedAt:
+            row.updated_at
+
+    };
+
 }
 
 
@@ -220,21 +209,148 @@ async function getAllQueuesFromDatabase() {
 ========================================================= */
 
 async function getActiveDaresFromDatabase() {
-  const result = await pool.query(`
-    SELECT *
-    FROM dares
-    WHERE status = 'accepted'
-    ORDER BY accepted_at ASC, id ASC
-  `);
 
-  const active = {};
+    const result =
+        await pool.query(`
 
-  for (const row of result.rows) {
-    active[row.streamer] =
-      formatDare(row);
-  }
+            SELECT *
 
-  return active;
+            FROM dares
+
+            WHERE status = 'accepted'
+
+            ORDER BY accepted_at ASC, id ASC
+
+        `);
+
+
+    const active = {};
+
+
+    result.rows.forEach(
+        row => {
+
+            const key =
+                String(
+                    row.streamer
+                )
+                .trim()
+                .toLowerCase();
+
+
+            active[key] =
+                formatDare(row);
+
+        }
+    );
+
+
+    return active;
+
+}
+
+
+/* =========================================================
+   GET QUEUES
+========================================================= */
+
+async function getAllQueuesFromDatabase() {
+
+    const result =
+        await pool.query(`
+
+            SELECT *
+
+            FROM dares
+
+            WHERE status = 'pending'
+
+            ORDER BY created_at ASC, id ASC
+
+        `);
+
+
+    const queues = {};
+
+
+    result.rows.forEach(
+        row => {
+
+            const key =
+                String(
+                    row.streamer
+                )
+                .trim()
+                .toLowerCase();
+
+
+            if (!queues[key]) {
+
+                queues[key] = [];
+
+            }
+
+
+            queues[key].push(
+                formatDare(row)
+            );
+
+        }
+    );
+
+
+    return queues;
+
+}
+
+
+/* =========================================================
+   SEND STATE
+========================================================= */
+
+async function sendState(ws) {
+
+    try {
+
+        const active =
+            await getActiveDaresFromDatabase();
+
+
+        const queues =
+            await getAllQueuesFromDatabase();
+
+
+        if (
+            ws.readyState ===
+            WebSocket.OPEN
+        ) {
+
+            ws.send(
+                JSON.stringify({
+
+                    type:
+                        "STATE",
+
+                    active:
+                        active,
+
+                    queues:
+                        queues
+
+                })
+            );
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            "❌ Failed to send state:",
+            error
+        );
+
+    }
+
 }
 
 
@@ -242,24 +358,46 @@ async function getActiveDaresFromDatabase() {
    GET ACTIVE DARE FOR STREAMER
 ========================================================= */
 
-async function getActiveDareForStreamer(streamer) {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM dares
-      WHERE streamer = $1
-        AND status = 'accepted'
-      ORDER BY accepted_at ASC, id ASC
-      LIMIT 1
-    `,
-    [streamer]
-  );
+async function getActiveDareForStreamer(
+    streamer
+) {
 
-  if (result.rows.length === 0) {
-    return null;
-  }
+    const result =
+        await pool.query(
 
-  return formatDare(result.rows[0]);
+            `
+
+            SELECT *
+
+            FROM dares
+
+            WHERE LOWER(TRIM(streamer))
+                = LOWER(TRIM($1))
+
+            AND status = 'accepted'
+
+            ORDER BY accepted_at ASC, id ASC
+
+            LIMIT 1
+
+            `,
+
+            [streamer]
+
+        );
+
+
+    if (!result.rows.length) {
+
+        return null;
+
+    }
+
+
+    return formatDare(
+        result.rows[0]
+    );
+
 }
 
 
@@ -267,38 +405,145 @@ async function getActiveDareForStreamer(streamer) {
    GET STREAMER QUEUE
 ========================================================= */
 
-async function getStreamerQueue(streamer) {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM dares
-      WHERE streamer = $1
-        AND status = 'pending'
-      ORDER BY created_at ASC, id ASC
-    `,
-    [streamer]
-  );
+async function getStreamerQueue(
+    streamer
+) {
 
-  return result.rows.map(formatDare);
+    const result =
+        await pool.query(
+
+            `
+
+            SELECT *
+
+            FROM dares
+
+            WHERE LOWER(TRIM(streamer))
+                = LOWER(TRIM($1))
+
+            AND status = 'pending'
+
+            ORDER BY created_at ASC, id ASC
+
+            `,
+
+            [streamer]
+
+        );
+
+
+    return result.rows.map(
+        formatDare
+    );
+
 }
 
 
 /* =========================================================
-   CURRENT STATE
+   DATABASE INITIALIZATION
 ========================================================= */
 
-async function getCurrentState() {
-  const [queues, active] =
-    await Promise.all([
-      getAllQueuesFromDatabase(),
-      getActiveDaresFromDatabase()
-    ]);
+async function initializeDatabase() {
 
-  return {
-    active,
-    queues
-  };
+    await pool.query(`
+
+        CREATE TABLE IF NOT EXISTS dares (
+
+            id SERIAL PRIMARY KEY,
+
+            streamer VARCHAR(255) NOT NULL,
+
+            streamer_source VARCHAR(50)
+                NOT NULL
+                DEFAULT 'twitch_username',
+
+            viewer VARCHAR(255)
+                NOT NULL
+                DEFAULT 'Anonymous',
+
+            dare_text TEXT NOT NULL,
+
+            duration INTEGER NOT NULL,
+
+            reward NUMERIC(12,2)
+                NOT NULL
+                DEFAULT 0,
+
+            status VARCHAR(30)
+                NOT NULL
+                DEFAULT 'pending',
+
+            created_at TIMESTAMP WITH TIME ZONE
+                NOT NULL
+                DEFAULT NOW(),
+
+            accepted_at TIMESTAMP WITH TIME ZONE,
+
+            updated_at TIMESTAMP WITH TIME ZONE
+
+        );
+
+    `);
+
+
+    await pool.query(`
+
+        CREATE INDEX IF NOT EXISTS
+        idx_dares_streamer_status
+
+        ON dares (
+            streamer,
+            status
+        );
+
+    `);
+
+
+    await pool.query(`
+
+        CREATE INDEX IF NOT EXISTS
+        idx_dares_created_at
+
+        ON dares (
+            created_at
+        );
+
+    `);
+
+
+    console.log(
+        "✅ Database initialized."
+    );
+
 }
+
+
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
+app.get(
+    "/",
+    function(req, res) {
+
+        res.json({
+
+            status:
+                "online",
+
+            service:
+                "dare-backend",
+
+            websocket:
+                "/ws",
+
+            time:
+                new Date().toISOString()
+
+        });
+
+    }
+);
 
 
 /* =========================================================
@@ -306,234 +551,539 @@ async function getCurrentState() {
 ========================================================= */
 
 const connectedStreamers = [
-  {
-    username: "IShowSloow_",
-    displayName: "IShowSloow_",
-    connected: true
-  }
+
+    {
+
+        username:
+            "IShowSloow_",
+
+        displayName:
+            "IShowSloow_",
+
+        connected:
+            true
+
+    }
+
 ];
 
 
-/* =========================================================
-   ROOT
-========================================================= */
+app.get(
+    "/api/streamers",
+    function(req, res) {
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "online",
-    service: "dare-backend",
-    websocket: "/ws"
-  });
-});
+        res.json(
+            connectedStreamers
+        );
 
-
-/* =========================================================
-   GET STREAMERS
-========================================================= */
-
-app.get("/api/streamers", (req, res) => {
-  res.json(connectedStreamers);
-});
+    }
+);
 
 
 /* =========================================================
    CREATE DARE
+=========================================================
+
+   NEW BEHAVIOR:
+
+   If streamer has NO active dare:
+
+       submission
+          ↓
+       ACCEPTED
+          ↓
+       ACTIVE_DARE
+          ↓
+       OVERLAY
+
+   If streamer ALREADY has active dare:
+
+       submission
+          ↓
+       PENDING
+          ↓
+       QUEUE
+
 ========================================================= */
 
-app.post("/api/dare", async (req, res) => {
-  try {
-    const {
-      streamer,
-      streamer_source,
-      viewer,
-      dare_text,
-      duration,
-      reward
-    } = req.body;
+app.post(
+    "/api/dare",
+    async function(req, res) {
 
-    /* -----------------------------------------
-       VALIDATION
-    ----------------------------------------- */
+        const {
 
-    if (!streamer || !String(streamer).trim()) {
-      return res.status(400).json({
-        error: "Streamer is required."
-      });
-    }
-
-    if (!dare_text || !String(dare_text).trim()) {
-      return res.status(400).json({
-        error: "Dare text is required."
-      });
-    }
-
-    const cleanStreamer =
-      String(streamer).trim();
-
-    const cleanViewer =
-      viewer && String(viewer).trim()
-        ? String(viewer).trim()
-        : "Anonymous";
-
-    const cleanDare =
-      String(dare_text).trim();
-
-    const cleanDuration =
-      Number(duration);
-
-    const cleanReward =
-      Number(reward || 0);
-
-    if (
-      !Number.isFinite(cleanDuration) ||
-      cleanDuration < 5 ||
-      cleanDuration > 300
-    ) {
-      return res.status(400).json({
-        error:
-          "Duration must be between 5 and 300 seconds."
-      });
-    }
-
-    if (
-      !Number.isFinite(cleanReward) ||
-      cleanReward < 0
-    ) {
-      return res.status(400).json({
-        error:
-          "Reward must be 0 or greater."
-      });
-    }
-
-
-    /* -----------------------------------------
-       CHECK IF STREAMER ALREADY HAS ACTIVE DARE
-    ----------------------------------------- */
-
-    const activeDare =
-      await getActiveDareForStreamer(
-        cleanStreamer
-      );
-
-
-    /* -----------------------------------------
-       CREATE AS PENDING
-       
-       IMPORTANT:
-       NEVER automatically activate it.
-    ----------------------------------------- */
-
-    const result =
-      await pool.query(
-        `
-          INSERT INTO dares (
             streamer,
+
             streamer_source,
+
             viewer,
+
             dare_text,
+
             duration,
-            reward,
-            status
-          )
-          VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            'pending'
-          )
-          RETURNING *
-        `,
-        [
-          cleanStreamer,
-          streamer_source || "twitch_username",
-          cleanViewer,
-          cleanDare,
-          cleanDuration,
-          cleanReward
-        ]
-      );
+
+            reward
+
+        } = req.body;
 
 
-    const dare =
-      formatDare(result.rows[0]);
+        /* -------------------------------------------------
+           VALIDATION
+        ------------------------------------------------- */
+
+        if (
+            !streamer ||
+            typeof streamer !== "string"
+        ) {
+
+            return res.status(400).json({
+
+                error:
+                    "Streamer is required."
+
+            });
+
+        }
 
 
-    /* -----------------------------------------
-       BROADCAST NEW DARE
-    ----------------------------------------- */
+        if (
+            !dare_text ||
+            typeof dare_text !== "string"
+        ) {
 
-    broadcast({
-      type: "DARE_CREATED",
-      dare
-    });
+            return res.status(400).json({
 
+                error:
+                    "Dare text is required."
 
-    /* -----------------------------------------
-       UPDATE QUEUE
-    ----------------------------------------- */
+            });
 
-    const queue =
-      await getStreamerQueue(
-        cleanStreamer
-      );
-
-    broadcast({
-      type: "QUEUE_UPDATED",
-      streamer: cleanStreamer,
-      queue
-    });
+        }
 
 
-    /* -----------------------------------------
-       RESPONSE
-    ----------------------------------------- */
+        const cleanDareText =
+            dare_text.trim();
 
-    return res.status(201).json({
-      success: true,
-      dare,
-      activeDare
-    });
 
-  } catch (error) {
-    console.error(
-      "Create dare error:",
-      error
-    );
+        if (!cleanDareText) {
 
-    return res.status(500).json({
-      error:
-        "Failed to create dare."
-    });
-  }
-});
+            return res.status(400).json({
+
+                error:
+                    "Dare text cannot be empty."
+
+            });
+
+        }
+
+
+        const durationNumber =
+            Number(duration);
+
+
+        if (
+            !Number.isFinite(
+                durationNumber
+            ) ||
+            durationNumber < 5 ||
+            durationNumber > 300
+        ) {
+
+            return res.status(400).json({
+
+                error:
+                    "Duration must be between 5 and 300 seconds."
+
+            });
+
+        }
+
+
+        const rewardNumber =
+            Number(reward || 0);
+
+
+        if (
+            !Number.isFinite(
+                rewardNumber
+            ) ||
+            rewardNumber < 0
+        ) {
+
+            return res.status(400).json({
+
+                error:
+                    "Reward cannot be negative."
+
+            });
+
+        }
+
+
+        const cleanStreamer =
+            streamer.trim();
+
+
+        const cleanViewer =
+            String(
+                viewer ||
+                "Anonymous"
+            ).trim() ||
+            "Anonymous";
+
+
+        const cleanSource =
+            String(
+                streamer_source ||
+                "twitch_username"
+            ).trim();
+
+
+        const client =
+            await pool.connect();
+
+
+        try {
+
+            await client.query(
+                "BEGIN"
+            );
+
+
+            /*
+             * IMPORTANT:
+             *
+             * Lock this streamer's transaction
+             * so two simultaneous submissions
+             * cannot both become active.
+             */
+
+            await client.query(
+                `
+                SELECT
+                    pg_advisory_xact_lock(
+                        hashtext(
+                            LOWER(TRIM($1))
+                        )
+                    )
+                `,
+                [cleanStreamer]
+            );
+
+
+            /*
+             * Check whether this streamer
+             * already has an active dare.
+             */
+
+            const activeResult =
+                await client.query(
+
+                    `
+
+                    SELECT *
+
+                    FROM dares
+
+                    WHERE LOWER(TRIM(streamer))
+                        = LOWER(TRIM($1))
+
+                    AND status = 'accepted'
+
+                    LIMIT 1
+
+                    `,
+
+                    [cleanStreamer]
+
+                );
+
+
+            const hasActiveDare =
+                activeResult.rows.length > 0;
+
+
+            /*
+             * Decide status BEFORE inserting.
+             */
+
+            const newStatus =
+                hasActiveDare
+                    ? "pending"
+                    : "accepted";
+
+
+            /*
+             * Insert the dare.
+             */
+
+            const insertResult =
+                await client.query(
+
+                    `
+
+                    INSERT INTO dares (
+
+                        streamer,
+
+                        streamer_source,
+
+                        viewer,
+
+                        dare_text,
+
+                        duration,
+
+                        reward,
+
+                        status,
+
+                        accepted_at,
+
+                        updated_at
+
+                    )
+
+                    VALUES (
+
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+
+                        CASE
+                            WHEN $7 = 'accepted'
+                            THEN NOW()
+                            ELSE NULL
+                        END,
+
+                        NOW()
+
+                    )
+
+                    RETURNING *
+
+                    `,
+
+                    [
+
+                        cleanStreamer,
+
+                        cleanSource,
+
+                        cleanViewer,
+
+                        cleanDareText,
+
+                        Math.floor(
+                            durationNumber
+                        ),
+
+                        rewardNumber,
+
+                        newStatus
+
+                    ]
+
+                );
+
+
+            const dare =
+                formatDare(
+                    insertResult.rows[0]
+                );
+
+
+            await client.query(
+                "COMMIT"
+            );
+
+
+            /* -------------------------------------------------
+               IMMEDIATELY ACTIVE
+            ------------------------------------------------- */
+
+            if (
+                newStatus ===
+                "accepted"
+            ) {
+
+                console.log(
+                    "🔥 DARE IMMEDIATELY ACTIVE:",
+                    dare
+                );
+
+
+                /*
+                 * Send ACTIVE_DARE directly.
+                 *
+                 * We intentionally do NOT send
+                 * DARE_CREATED here because your
+                 * controller previously tried to
+                 * accept DARE_CREATED itself.
+                 *
+                 * This prevents duplicate activation.
+                 */
+
+                broadcast({
+
+                    type:
+                        "ACTIVE_DARE",
+
+                    dare:
+                        dare
+
+                });
+
+
+                return res.status(201).json({
+
+                    success:
+                        true,
+
+                    message:
+                        "Dare is now LIVE.",
+
+                    dare:
+                        dare
+
+                });
+
+            }
+
+
+            /* -------------------------------------------------
+               PENDING
+            ------------------------------------------------- */
+
+            console.log(
+                "🟡 DARE ADDED TO QUEUE:",
+                dare
+            );
+
+
+            /*
+             * Tell clients about the new
+             * pending queue state.
+             */
+
+            const queue =
+                await getStreamerQueue(
+                    cleanStreamer
+                );
+
+
+            broadcast({
+
+                type:
+                    "QUEUE_UPDATED",
+
+                streamer:
+                    cleanStreamer,
+
+                queue:
+                    queue
+
+            });
+
+
+            return res.status(201).json({
+
+                success:
+                    true,
+
+                message:
+                    "Dare added to pending queue.",
+
+                dare:
+                    dare
+
+            });
+
+
+        } catch (error) {
+
+            try {
+
+                await client.query(
+                    "ROLLBACK"
+                );
+
+            } catch (_) {}
+
+
+            console.error(
+                "❌ CREATE DARE ERROR:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                error:
+                    "Failed to create dare."
+
+            });
+
+        } finally {
+
+            client.release();
+
+        }
+
+    }
+);
 
 
 /* =========================================================
    GET ALL DARE STATE
 ========================================================= */
 
-app.get("/api/dare", async (req, res) => {
-  try {
-    const state =
-      await getCurrentState();
+app.get(
+    "/api/dare",
+    async function(req, res) {
 
-    res.json(state);
+        try {
 
-  } catch (error) {
-    console.error(
-      "Get dare state error:",
-      error
-    );
+            const active =
+                await getActiveDaresFromDatabase();
 
-    res.status(500).json({
-      error:
-        "Failed to get dare state."
-    });
-  }
-});
+
+            const queues =
+                await getAllQueuesFromDatabase();
+
+
+            res.json({
+
+                active:
+                    active,
+
+                queues:
+                    queues
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to get dare state."
+
+            });
+
+        }
+
+    }
+);
 
 
 /* =========================================================
@@ -541,36 +1091,38 @@ app.get("/api/dare", async (req, res) => {
 ========================================================= */
 
 app.get(
-  "/api/dare/queue/:streamer",
-  async (req, res) => {
+    "/api/dare/queue/:streamer",
+    async function(req, res) {
 
-    try {
-      const streamer =
-        req.params.streamer;
+        try {
 
-      const queue =
-        await getStreamerQueue(
-          streamer
-        );
+            const queue =
+                await getStreamerQueue(
+                    req.params.streamer
+                );
 
-      res.json({
-        streamer,
-        queue
-      });
 
-    } catch (error) {
-      console.error(
-        "Get queue error:",
-        error
-      );
+            res.json(
+                queue
+            );
 
-      res.status(500).json({
-        error:
-          "Failed to get queue."
-      });
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to get queue."
+
+            });
+
+        }
+
     }
-
-  }
 );
 
 
@@ -579,404 +1131,575 @@ app.get(
 ========================================================= */
 
 app.get(
-  "/api/dare/active/:streamer",
-  async (req, res) => {
+    "/api/dare/active/:streamer",
+    async function(req, res) {
 
-    try {
-      const streamer =
-        req.params.streamer;
+        try {
 
-      const active =
-        await getActiveDareForStreamer(
-          streamer
-        );
+            const dare =
+                await getActiveDareForStreamer(
+                    req.params.streamer
+                );
 
-      res.json({
-        streamer,
-        activeDare: active
-      });
 
-    } catch (error) {
-      console.error(
-        "Get active dare error:",
-        error
-      );
+            res.json(
+                dare
+            );
 
-      res.status(500).json({
-        error:
-          "Failed to get active dare."
-      });
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to get active dare."
+
+            });
+
+        }
+
     }
-
-  }
 );
 
 
 /* =========================================================
-   ACCEPT / REJECT / COMPLETE / FAIL
+   UPDATE DARE STATUS
 ========================================================= */
 
 app.post(
-  "/api/dare/:id/status",
-  async (req, res) => {
+    "/api/dare/:id/status",
+    async function(req, res) {
 
-    try {
-
-      const id =
-        Number(req.params.id);
-
-      const {
-        status
-      } = req.body;
+        const id =
+            Number(
+                req.params.id
+            );
 
 
-      if (!Number.isInteger(id)) {
-        return res.status(400).json({
-          error:
-            "Invalid dare ID."
-        });
-      }
+        const status =
+            String(
+                req.body.status ||
+                ""
+            ).trim().toLowerCase();
 
 
-      const allowedStatuses = [
-        "accepted",
-        "rejected",
-        "completed",
-        "failed"
-      ];
+        const allowedStatuses = [
+
+            "accepted",
+
+            "rejected",
+
+            "completed",
+
+            "failed"
+
+        ];
 
 
-      if (
-        !allowedStatuses.includes(status)
-      ) {
+        if (
+            !Number.isInteger(id)
+        ) {
 
-        return res.status(400).json({
-          error:
-            "Invalid status."
-        });
+            return res.status(400).json({
 
-      }
+                error:
+                    "Invalid dare ID."
 
-
-      /* =====================================================
-         ACCEPT
-      ===================================================== */
-
-      if (status === "accepted") {
-
-        /* -----------------------------------------
-           Get requested dare
-        ----------------------------------------- */
-
-        const dareResult =
-          await pool.query(
-            `
-              SELECT *
-              FROM dares
-              WHERE id = $1
-              LIMIT 1
-            `,
-            [id]
-          );
-
-
-        if (dareResult.rows.length === 0) {
-
-          return res.status(404).json({
-            error:
-              "Dare not found."
-          });
+            });
 
         }
 
 
-        const dare =
-          dareResult.rows[0];
+        if (
+            !allowedStatuses.includes(
+                status
+            )
+        ) {
 
+            return res.status(400).json({
 
-        /* -----------------------------------------
-           Only pending dares can be accepted
-        ----------------------------------------- */
+                error:
+                    "Invalid status."
 
-        if (dare.status !== "pending") {
-
-          return res.status(400).json({
-            error:
-              `Dare cannot be accepted because its current status is "${dare.status}".`
-          });
+            });
 
         }
 
 
-        /* -----------------------------------------
-           CHECK ACTIVE DARE
-        ----------------------------------------- */
-
-        const active =
-          await getActiveDareForStreamer(
-            dare.streamer
-          );
+        const client =
+            await pool.connect();
 
 
-        if (active) {
+        try {
 
-          return res.status(409).json({
-            error:
-              "This streamer already has an active dare.",
-            activeDare: active
-          });
+            await client.query(
+                "BEGIN"
+            );
+
+
+            /*
+             * Lock the dare row.
+             */
+
+            const dareResult =
+                await client.query(
+
+                    `
+
+                    SELECT *
+
+                    FROM dares
+
+                    WHERE id = $1
+
+                    FOR UPDATE
+
+                    `,
+
+                    [id]
+
+                );
+
+
+            if (
+                !dareResult.rows.length
+            ) {
+
+                await client.query(
+                    "ROLLBACK"
+                );
+
+
+                return res.status(404).json({
+
+                    error:
+                        "Dare not found."
+
+                });
+
+            }
+
+
+            const existing =
+                dareResult.rows[0];
+
+
+            const streamer =
+                existing.streamer;
+
+
+            /* -------------------------------------------------
+               ACCEPT
+            ------------------------------------------------- */
+
+            if (
+                status ===
+                "accepted"
+            ) {
+
+                /*
+                 * Check if another dare
+                 * is already active.
+                 */
+
+                const activeResult =
+                    await client.query(
+
+                        `
+
+                        SELECT *
+
+                        FROM dares
+
+                        WHERE LOWER(TRIM(streamer))
+                            = LOWER(TRIM($1))
+
+                        AND status = 'accepted'
+
+                        AND id <> $2
+
+                        LIMIT 1
+
+                        `,
+
+                        [
+                            streamer,
+                            id
+                        ]
+
+                    );
+
+
+                if (
+                    activeResult.rows.length
+                ) {
+
+                    await client.query(
+                        "ROLLBACK"
+                    );
+
+
+                    return res.status(409).json({
+
+                        error:
+                            "Another dare is already active for this streamer."
+
+                    });
+
+                }
+
+
+                const result =
+                    await client.query(
+
+                        `
+
+                        UPDATE dares
+
+                        SET
+
+                            status = 'accepted',
+
+                            accepted_at =
+                                COALESCE(
+                                    accepted_at,
+                                    NOW()
+                                ),
+
+                            updated_at =
+                                NOW()
+
+                        WHERE id = $1
+
+                        RETURNING *
+
+                        `,
+
+                        [id]
+
+                    );
+
+
+                const dare =
+                    formatDare(
+                        result.rows[0]
+                    );
+
+
+                await client.query(
+                    "COMMIT"
+                );
+
+
+                broadcast({
+
+                    type:
+                        "ACTIVE_DARE",
+
+                    dare:
+                        dare
+
+                });
+
+
+                return res.json({
+
+                    success:
+                        true,
+
+                    dare:
+                        dare
+
+                });
+
+            }
+
+
+            /* -------------------------------------------------
+               REJECT
+            ------------------------------------------------- */
+
+            if (
+                status ===
+                "rejected"
+            ) {
+
+                const result =
+                    await client.query(
+
+                        `
+
+                        UPDATE dares
+
+                        SET
+
+                            status = 'rejected',
+
+                            updated_at =
+                                NOW()
+
+                        WHERE id = $1
+
+                        RETURNING *
+
+                        `,
+
+                        [id]
+
+                    );
+
+
+                const dare =
+                    formatDare(
+                        result.rows[0]
+                    );
+
+
+                await client.query(
+                    "COMMIT"
+                );
+
+
+                const queue =
+                    await getStreamerQueue(
+                        streamer
+                    );
+
+
+                broadcast({
+
+                    type:
+                        "DARE_REJECTED",
+
+                    dare:
+                        dare
+
+                });
+
+
+                broadcast({
+
+                    type:
+                        "QUEUE_UPDATED",
+
+                    streamer:
+                        streamer,
+
+                    queue:
+                        queue
+
+                });
+
+
+                return res.json({
+
+                    success:
+                        true,
+
+                    dare:
+                        dare
+
+                });
+
+            }
+
+
+            /* -------------------------------------------------
+               COMPLETED / FAILED
+            ------------------------------------------------- */
+
+            if (
+                status ===
+                "completed" ||
+                status ===
+                "failed"
+            ) {
+
+                /*
+                 * Only allow completion/failure
+                 * of an active dare.
+                 */
+
+                if (
+                    existing.status !==
+                    "accepted"
+                ) {
+
+                    await client.query(
+                        "ROLLBACK"
+                    );
+
+
+                    return res.status(409).json({
+
+                        error:
+                            "Only an active dare can be completed or failed."
+
+                    });
+
+                }
+
+
+                const result =
+                    await client.query(
+
+                        `
+
+                        UPDATE dares
+
+                        SET
+
+                            status = $1,
+
+                            updated_at =
+                                NOW()
+
+                        WHERE id = $2
+
+                        RETURNING *
+
+                        `,
+
+                        [
+                            status,
+                            id
+                        ]
+
+                    );
+
+
+                const dare =
+                    formatDare(
+                        result.rows[0]
+                    );
+
+
+                await client.query(
+                    "COMMIT"
+                );
+
+
+                if (
+                    status ===
+                    "completed"
+                ) {
+
+                    broadcast({
+
+                        type:
+                            "DARE_COMPLETED",
+
+                        dare:
+                            dare
+
+                    });
+
+                } else {
+
+                    broadcast({
+
+                        type:
+                            "DARE_FAILED",
+
+                        dare:
+                            dare
+
+                    });
+
+                }
+
+
+                broadcast({
+
+                    type:
+                        "ACTIVE_DARE_CLEARED",
+
+                    streamer:
+                        streamer
+
+                });
+
+
+                /*
+                 * IMPORTANT:
+                 *
+                 * We do NOT automatically
+                 * activate the next queued dare.
+                 *
+                 * It stays pending.
+                 */
+
+                const queue =
+                    await getStreamerQueue(
+                        streamer
+                    );
+
+
+                broadcast({
+
+                    type:
+                        "QUEUE_UPDATED",
+
+                    streamer:
+                        streamer,
+
+                    queue:
+                        queue
+
+                });
+
+
+                return res.json({
+
+                    success:
+                        true,
+
+                    dare:
+                        dare,
+
+                    queue:
+                        queue
+
+                });
+
+            }
+
+
+        } catch (error) {
+
+            try {
+
+                await client.query(
+                    "ROLLBACK"
+                );
+
+            } catch (_) {}
+
+
+            console.error(
+                "❌ STATUS UPDATE ERROR:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                error:
+                    "Failed to update dare status."
+
+            });
+
+        } finally {
+
+            client.release();
 
         }
-
-
-        /* -----------------------------------------
-           ACCEPT MANUALLY
-        ----------------------------------------- */
-
-        const result =
-          await pool.query(
-            `
-              UPDATE dares
-
-              SET
-                status = 'accepted',
-                accepted_at = NOW(),
-                updated_at = NOW()
-
-              WHERE id = $1
-
-              RETURNING *
-            `,
-            [id]
-          );
-
-
-        const acceptedDare =
-          formatDare(
-            result.rows[0]
-          );
-
-
-        /* -----------------------------------------
-           BROADCAST ACTIVE DARE
-        ----------------------------------------- */
-
-        broadcast({
-          type: "ACTIVE_DARE",
-          dare: acceptedDare
-        });
-
-
-        /* -----------------------------------------
-           UPDATE QUEUE
-        ----------------------------------------- */
-
-        const queue =
-          await getStreamerQueue(
-            dare.streamer
-          );
-
-
-        broadcast({
-          type: "QUEUE_UPDATED",
-          streamer: dare.streamer,
-          queue
-        });
-
-
-        return res.json({
-          success: true,
-          dare: acceptedDare
-        });
-
-      }
-
-
-      /* =====================================================
-         REJECT
-      ===================================================== */
-
-      if (status === "rejected") {
-
-        const result =
-          await pool.query(
-            `
-              UPDATE dares
-
-              SET
-                status = 'rejected',
-                updated_at = NOW()
-
-              WHERE id = $1
-                AND status = 'pending'
-
-              RETURNING *
-            `,
-            [id]
-          );
-
-
-        if (result.rows.length === 0) {
-
-          return res.status(404).json({
-            error:
-              "Pending dare not found."
-          });
-
-        }
-
-
-        const rejectedDare =
-          formatDare(
-            result.rows[0]
-          );
-
-
-        broadcast({
-          type: "DARE_REJECTED",
-          dare: rejectedDare
-        });
-
-
-        const queue =
-          await getStreamerQueue(
-            rejectedDare.streamer
-          );
-
-
-        broadcast({
-          type: "QUEUE_UPDATED",
-          streamer:
-            rejectedDare.streamer,
-          queue
-        });
-
-
-        return res.json({
-          success: true,
-          dare: rejectedDare
-        });
-
-      }
-
-
-      /* =====================================================
-         COMPLETE / FAIL
-      ===================================================== */
-
-      if (
-        status === "completed" ||
-        status === "failed"
-      ) {
-
-        const result =
-          await pool.query(
-            `
-              UPDATE dares
-
-              SET
-                status = $1,
-                updated_at = NOW()
-
-              WHERE id = $2
-                AND status = 'accepted'
-
-              RETURNING *
-            `,
-            [
-              status,
-              id
-            ]
-          );
-
-
-        if (result.rows.length === 0) {
-
-          return res.status(404).json({
-            error:
-              "Active dare not found."
-          });
-
-        }
-
-
-        const finishedDare =
-          formatDare(
-            result.rows[0]
-          );
-
-
-        /* -----------------------------------------
-           BROADCAST FINISH
-        ----------------------------------------- */
-
-        broadcast({
-          type:
-            status === "completed"
-              ? "DARE_COMPLETED"
-              : "DARE_FAILED",
-
-          dare: finishedDare
-        });
-
-
-        /* -----------------------------------------
-           CLEAR ACTIVE DARE
-           
-           IMPORTANT:
-           DO NOT ACTIVATE NEXT QUEUE ITEM.
-        ----------------------------------------- */
-
-        broadcast({
-          type: "ACTIVE_DARE_CLEARED",
-          streamer:
-            finishedDare.streamer
-        });
-
-
-        /* -----------------------------------------
-           SEND UPDATED QUEUE
-        ----------------------------------------- */
-
-        const queue =
-          await getStreamerQueue(
-            finishedDare.streamer
-          );
-
-
-        broadcast({
-          type: "QUEUE_UPDATED",
-          streamer:
-            finishedDare.streamer,
-          queue
-        });
-
-
-        return res.json({
-          success: true,
-          dare: finishedDare,
-          activeDare: null,
-          queue
-        });
-
-      }
-
-
-    } catch (error) {
-
-      console.error(
-        "Dare status error:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Failed to update dare status."
-      });
 
     }
-
-  }
 );
 
 
@@ -985,39 +1708,64 @@ app.post(
 ========================================================= */
 
 app.get(
-  "/api/dare/history",
-  async (req, res) => {
+    "/api/dare/history",
+    async function(req, res) {
 
-    try {
+        try {
 
-      const result =
-        await pool.query(`
-          SELECT *
-          FROM dares
-          ORDER BY created_at DESC
-          LIMIT 200
-        `);
+            const limit =
+                Math.min(
+                    Number(
+                        req.query.limit ||
+                        100
+                    ),
+                    500
+                );
 
 
-      res.json(
-        result.rows.map(formatDare)
-      );
+            const result =
+                await pool.query(
 
-    } catch (error) {
+                    `
 
-      console.error(
-        "History error:",
-        error
-      );
+                    SELECT *
 
-      res.status(500).json({
-        error:
-          "Failed to get history."
-      });
+                    FROM dares
+
+                    ORDER BY created_at DESC
+
+                    LIMIT $1
+
+                    `,
+
+                    [limit]
+
+                );
+
+
+            res.json(
+                result.rows.map(
+                    formatDare
+                )
+            );
+
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to get history."
+
+            });
+
+        }
 
     }
-
-  }
 );
 
 
@@ -1026,40 +1774,51 @@ app.get(
 ========================================================= */
 
 app.post(
-  "/api/dare/clear",
-  async (req, res) => {
+    "/api/dare/clear",
+    async function(req, res) {
 
-    try {
+        try {
 
-      await pool.query(`
-        DELETE FROM dares
-      `);
-
-
-      broadcast({
-        type: "RESET"
-      });
+            await pool.query(
+                "DELETE FROM dares"
+            );
 
 
-      res.json({
-        success: true
-      });
+            broadcast({
 
-    } catch (error) {
+                type:
+                    "RESET"
 
-      console.error(
-        "Clear dares error:",
-        error
-      );
+            });
 
-      res.status(500).json({
-        error:
-          "Failed to clear dares."
-      });
+
+            res.json({
+
+                success:
+                    true,
+
+                message:
+                    "All dares cleared."
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                error:
+                    "Failed to clear dares."
+
+            });
+
+        }
 
     }
-
-  }
 );
 
 
@@ -1069,23 +1828,55 @@ app.post(
 
 async function startServer() {
 
-  await initializeDatabase();
+    try {
+
+        await initializeDatabase();
 
 
-  server.listen(
-    PORT,
-    () => {
+        server.listen(
+            PORT,
+            function() {
 
-      console.log(
-        `Dare backend running on port ${PORT}`
-      );
+                console.log("");
+                console.log(
+                    "================================"
+                );
 
-      console.log(
-        `WebSocket running at /ws`
-      );
+                console.log(
+                    "🎯 DARE BACKEND ONLINE"
+                );
+
+                console.log(
+                    "================================"
+                );
+
+                console.log(
+                    "HTTP:",
+                    `http://localhost:${PORT}`
+                );
+
+                console.log(
+                    "WebSocket:",
+                    `ws://localhost:${PORT}/ws`
+                );
+
+                console.log(
+                    "================================"
+                );
+
+            }
+        );
+
+    } catch (error) {
+
+        console.error(
+            "❌ Failed to start server:",
+            error
+        );
+
+        process.exit(1);
 
     }
-  );
 
 }
 
