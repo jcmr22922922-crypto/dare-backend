@@ -1,3 +1,5 @@
+"use strict";
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -9,6 +11,7 @@ const app = express();
 const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 3000);
+
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
@@ -16,23 +19,19 @@ if (!DATABASE_URL) {
     process.exit(1);
 }
 
-/* =========================================================
+/* ============================================================
    CONFIG
-========================================================= */
+============================================================ */
 
 const FRONTEND_ORIGIN = (
     process.env.FRONTEND_ORIGIN ||
     "https://jcmr22922922-crypto.github.io"
-).replace(/\/+$/, "");
+).replace(/\/$/, "");
 
-const SESSION_DAYS_RAW =
-    Number(process.env.SESSION_DAYS || 30);
-
-const SESSION_DAYS =
-    Number.isFinite(SESSION_DAYS_RAW) &&
-    SESSION_DAYS_RAW > 0
-        ? SESSION_DAYS_RAW
-        : 30;
+const SESSION_DAYS = Math.max(
+    1,
+    Number(process.env.SESSION_DAYS || 30)
+);
 
 const SESSION_TTL_MS =
     SESSION_DAYS *
@@ -41,17 +40,16 @@ const SESSION_TTL_MS =
     60 *
     1000;
 
-/*
- * IMPORTANT:
- * Twitch is NOT the identity of a streamer anymore.
- *
- * A Nerve account owns a streamer profile.
- * Streaming platform information is optional metadata.
- */
+const SESSION_COOKIE = "dare_session";
 
-/* =========================================================
+const MAX_DARE_LENGTH = 1000;
+const MIN_DARE_DURATION = 5;
+const MAX_DARE_DURATION = 300;
+const MAX_REWARD = 100000;
+
+/* ============================================================
    DATABASE
-========================================================= */
+============================================================ */
 
 const pool = new Pool({
     connectionString: DATABASE_URL,
@@ -67,16 +65,16 @@ const pool = new Pool({
     connectionTimeoutMillis: 10000
 });
 
-pool.on("error", error => {
+pool.on("error", (error) => {
     console.error(
         "Unexpected PostgreSQL pool error:",
         error
     );
 });
 
-/* =========================================================
-   MIDDLEWARE
-========================================================= */
+/* ============================================================
+   EXPRESS
+============================================================ */
 
 app.disable("x-powered-by");
 
@@ -87,8 +85,8 @@ app.use(
         methods: [
             "GET",
             "POST",
-            "PUT",
             "PATCH",
+            "PUT",
             "DELETE",
             "OPTIONS"
         ],
@@ -105,14 +103,29 @@ app.use(
     })
 );
 
-/* =========================================================
-   GENERAL HELPERS
-========================================================= */
+/* ============================================================
+   HELPERS
+============================================================ */
+
+function sendError(
+    res,
+    status,
+    message,
+    code = null
+) {
+    return res.status(status).json({
+        error: message,
+        ...(code
+            ? {
+                code
+            }
+            : {})
+    });
+}
 
 function normalizeUsername(value) {
     return String(value || "")
         .trim()
-        .replace(/^@/, "")
         .toLowerCase();
 }
 
@@ -129,11 +142,15 @@ function normalizeEmail(value) {
 }
 
 function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+        email
+    );
 }
 
 function isValidUsername(username) {
-    return /^[A-Za-z0-9_]{3,50}$/.test(username);
+    return /^[a-z0-9_]{3,50}$/.test(
+        username
+    );
 }
 
 function isValidPassword(password) {
@@ -155,7 +172,7 @@ function parsePositiveInteger(value) {
 
     if (
         !Number.isInteger(number) ||
-        number < 0
+        number < 1
     ) {
         return null;
     }
@@ -168,7 +185,8 @@ function parseReward(value) {
 
     if (
         !Number.isFinite(number) ||
-        number < 0
+        number < 0 ||
+        number > MAX_REWARD
     ) {
         return null;
     }
@@ -176,66 +194,47 @@ function parseReward(value) {
     return Math.round(number * 100) / 100;
 }
 
-function sendError(
-    res,
-    status,
-    code,
-    message
-) {
-    return res.status(status).json({
-        error: {
-            code,
-            message
-        }
-    });
-}
-
 function normalizePlatform(value) {
-    const platform =
-        String(value || "")
-            .trim()
-            .toLowerCase();
+    const platform = String(
+        value || ""
+    )
+        .trim()
+        .toLowerCase();
 
-    if (!platform) {
-        return null;
+    if (
+        [
+            "twitch",
+            "youtube",
+            "kick",
+            "other"
+        ].includes(platform)
+    ) {
+        return platform;
     }
 
-    const allowed = [
-        "twitch",
-        "youtube",
-        "kick",
-        "other"
-    ];
-
-    return allowed.includes(platform)
-        ? platform
-        : null;
+    return null;
 }
 
-/* =========================================================
+/* ============================================================
    PASSWORD HASHING
-========================================================= */
-
-const SCRYPT_KEY_LENGTH = 64;
+============================================================ */
 
 function hashPassword(password) {
     return new Promise(
         (resolve, reject) => {
-
             const salt =
                 crypto.randomBytes(16);
 
             crypto.scrypt(
                 password,
                 salt,
-                SCRYPT_KEY_LENGTH,
+                64,
                 {
                     N: 16384,
                     r: 8,
                     p: 1
                 },
                 (error, derivedKey) => {
-
                     if (error) {
                         reject(error);
                         return;
@@ -260,9 +259,7 @@ function verifyPassword(
 ) {
     return new Promise(
         (resolve, reject) => {
-
             try {
-
                 const parts =
                     String(
                         storedHash || ""
@@ -282,7 +279,7 @@ function verifyPassword(
                         "hex"
                     );
 
-                const expected =
+                const storedKey =
                     Buffer.from(
                         parts[2],
                         "hex"
@@ -291,14 +288,16 @@ function verifyPassword(
                 crypto.scrypt(
                     password,
                     salt,
-                    expected.length,
+                    storedKey.length,
                     {
                         N: 16384,
                         r: 8,
                         p: 1
                     },
-                    (error, derivedKey) => {
-
+                    (
+                        error,
+                        derivedKey
+                    ) => {
                         if (error) {
                             reject(error);
                             return;
@@ -306,7 +305,7 @@ function verifyPassword(
 
                         if (
                             derivedKey.length !==
-                            expected.length
+                            storedKey.length
                         ) {
                             resolve(false);
                             return;
@@ -315,12 +314,11 @@ function verifyPassword(
                         resolve(
                             crypto.timingSafeEqual(
                                 derivedKey,
-                                expected
+                                storedKey
                             )
                         );
                     }
                 );
-
             } catch (error) {
                 reject(error);
             }
@@ -328,11 +326,11 @@ function verifyPassword(
     );
 }
 
-/* =========================================================
+/* ============================================================
    SESSION HELPERS
-========================================================= */
+============================================================ */
 
-function generateSessionToken() {
+function createSessionToken() {
     return crypto
         .randomBytes(32)
         .toString("hex");
@@ -345,172 +343,119 @@ function hashSessionToken(token) {
         .digest("hex");
 }
 
-function parseCookies(req) {
-    const header =
-        req.headers.cookie;
-
-    if (!header) {
-        return {};
-    }
-
+function parseCookies(
+    cookieHeader
+) {
     const cookies = {};
 
-    header
-        .split(";")
-        .forEach(part => {
+    if (!cookieHeader) {
+        return cookies;
+    }
 
-            const index =
-                part.indexOf("=");
+    for (
+        const part of cookieHeader.split(";")
+    ) {
+        const index =
+            part.indexOf("=");
 
-            if (index === -1) {
-                return;
-            }
+        if (index === -1) {
+            continue;
+        }
 
-            const name =
-                part
-                    .slice(0, index)
-                    .trim();
+        const key =
+            part.slice(0, index).trim();
 
-            const value =
-                part
-                    .slice(index + 1)
-                    .trim();
+        const value =
+            part
+                .slice(index + 1)
+                .trim();
 
-            if (!name) {
-                return;
-            }
-
-            try {
-                cookies[name] =
-                    decodeURIComponent(
-                        value
-                    );
-            } catch (_) {
-                cookies[name] = value;
-            }
-        });
+        if (key) {
+            cookies[key] =
+                decodeURIComponent(
+                    value
+                );
+        }
+    }
 
     return cookies;
 }
 
-/* =========================================================
-   COOKIE
-========================================================= */
-
-function appendCookie(
+function appendSessionCookie(
     res,
-    name,
-    value,
-    options = {}
+    token,
+    maxAgeSeconds
 ) {
-    const parts = [
-        `${name}=${encodeURIComponent(value)}`
-    ];
-
-    parts.push(
-        `Path=${options.path || "/"}`
-    );
-
-    if (
-        options.maxAge !== undefined
-    ) {
-        parts.push(
-            `Max-Age=${Math.floor(
-                options.maxAge
-            )}`
-        );
-    }
-
-    if (
-        options.httpOnly !== false
-    ) {
-        parts.push("HttpOnly");
-    }
-
-    if (
-        options.secure !== false
-    ) {
-        parts.push("Secure");
-    }
-
-    if (
-        options.sameSite
-    ) {
-        parts.push(
-            `SameSite=${options.sameSite}`
-        );
-    }
-
-    if (
-        options.partitioned
-    ) {
-        parts.push("Partitioned");
-    }
-
-    const existing =
-        res.getHeader("Set-Cookie");
-
     const cookie =
-        parts.join("; ");
+        [
+            `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
+            "Path=/",
+            `Max-Age=${maxAgeSeconds}`,
+            "HttpOnly",
+            "Secure",
+            "SameSite=None",
+            "Partitioned"
+        ].join("; ");
 
-    if (!existing) {
-        res.setHeader(
-            "Set-Cookie",
-            [cookie]
-        );
-    } else {
-        res.setHeader(
-            "Set-Cookie",
-            [
-                ...existing,
-                cookie
-            ]
-        );
-    }
-}
-
-function setSessionCookie(
-    res,
-    token
-) {
-    appendCookie(
-        res,
-        "dare_session",
-        token,
-        {
-            maxAge:
-                SESSION_TTL_MS / 1000,
-            httpOnly: true,
-            secure: true,
-            sameSite: "None",
-            partitioned: true,
-            path: "/"
-        }
+    res.append(
+        "Set-Cookie",
+        cookie
     );
 }
 
 function clearSessionCookie(res) {
-    appendCookie(
-        res,
-        "dare_session",
-        "",
-        {
-            maxAge: 0,
-            httpOnly: true,
-            secure: true,
-            sameSite: "None",
-            partitioned: true,
-            path: "/"
-        }
+    const cookie =
+        [
+            `${SESSION_COOKIE}=`,
+            "Path=/",
+            "Max-Age=0",
+            "HttpOnly",
+            "Secure",
+            "SameSite=None",
+            "Partitioned"
+        ].join("; ");
+
+    res.append(
+        "Set-Cookie",
+        cookie
     );
 }
 
-/* =========================================================
-   AUTHENTICATION
-========================================================= */
+async function createSession(
+    userId
+) {
+    const token =
+        createSessionToken();
 
-async function getUserFromToken(token) {
+    const tokenHash =
+        hashSessionToken(token);
 
+    await pool.query(
+        `
+        INSERT INTO sessions (
+            user_id,
+            token_hash,
+            expires_at
+        )
+        VALUES (
+            $1,
+            $2,
+            NOW() + ($3 * INTERVAL '1 millisecond')
+        )
+        `,
+        [
+            userId,
+            tokenHash,
+            SESSION_TTL_MS
+        ]
+    );
+
+    return token;
+}
+
+async function getUserFromToken(
+    token
+) {
     if (!token) {
         return null;
     }
@@ -523,13 +468,12 @@ async function getUserFromToken(token) {
             `
             SELECT
                 s.id AS session_id,
-                s.user_id,
-                s.expires_at,
+                u.id,
                 u.username,
                 u.email,
                 u.role
             FROM sessions s
-            INNER JOIN users u
+            JOIN users u
                 ON u.id = s.user_id
             WHERE
                 s.token_hash = $1
@@ -545,7 +489,7 @@ async function getUserFromToken(token) {
         return null;
     }
 
-    const session =
+    const row =
         result.rows[0];
 
     await pool.query(
@@ -554,389 +498,339 @@ async function getUserFromToken(token) {
         SET last_seen_at = NOW()
         WHERE id = $1
         `,
-        [session.session_id]
+        [row.session_id]
     );
 
     return {
-        id: session.user_id,
-        username: session.username,
-        email: session.email,
-        role: session.role,
-        sessionId: session.session_id
+        id: row.id,
+        username: row.username,
+        email: row.email,
+        role: row.role,
+        sessionId: row.session_id
     };
 }
 
 async function authenticateRequest(
     req,
+    res = null
+) {
+    let token = null;
+
+    const authorization =
+        req.headers.authorization;
+
+    if (
+        authorization &&
+        authorization.startsWith(
+            "Bearer "
+        )
+    ) {
+        token =
+            authorization
+                .slice(7)
+                .trim();
+    }
+
+    if (!token) {
+        const cookies =
+            parseCookies(
+                req.headers.cookie
+            );
+
+        token =
+            cookies[
+                SESSION_COOKIE
+            ];
+    }
+
+    if (!token) {
+        return null;
+    }
+
+    const user =
+        await getUserFromToken(
+            token
+        );
+
+    if (
+        !user &&
+        res
+    ) {
+        clearSessionCookie(res);
+    }
+
+    return user;
+}
+
+async function requireAuth(
+    req,
     res,
     next
 ) {
     try {
-
-        const cookies =
-            parseCookies(req);
-
-        const authorization =
-            req.headers.authorization || "";
-
-        let token = null;
-        let usedCookie = false;
-
-        if (
-            authorization.startsWith(
-                "Bearer "
-            )
-        ) {
-
-            token =
-                authorization
-                    .slice(7)
-                    .trim();
-
-        } else if (
-            cookies.dare_session
-        ) {
-
-            token =
-                cookies.dare_session;
-
-            usedCookie = true;
-        }
-
-        if (!token) {
-            req.user = null;
-            next();
-            return;
-        }
-
         const user =
-            await getUserFromToken(
-                token
+            await authenticateRequest(
+                req,
+                res
             );
 
         if (!user) {
-
-            req.user = null;
-
-            if (usedCookie) {
-                clearSessionCookie(res);
-            }
-
-            next();
-            return;
+            return sendError(
+                res,
+                401,
+                "Authentication required.",
+                "AUTH_REQUIRED"
+            );
         }
 
         req.user = user;
 
         next();
-
     } catch (error) {
-
         console.error(
             "Authentication error:",
             error
         );
 
-        next(error);
-    }
-}
-
-function requireAuth(
-    req,
-    res,
-    next
-) {
-    if (!req.user) {
         return sendError(
             res,
-            401,
-            "AUTH_REQUIRED",
-            "You must be logged in."
+            500,
+            "Authentication service error."
         );
     }
-
-    next();
 }
 
-/* =========================================================
-   DATABASE INITIALIZATION / MIGRATION
-========================================================= */
+/* ============================================================
+   DATABASE INITIALIZATION
+============================================================ */
 
 async function initializeDatabase() {
-
     const client =
         await pool.connect();
 
     try {
+        await client.query(
+            "BEGIN"
+        );
 
-        await client.query("BEGIN");
-
-        /* =========================
-           USERS
-        ========================= */
+        /*
+         * USERS
+         */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
-
-                username VARCHAR(50) NOT NULL,
-
-                email VARCHAR(255) NOT NULL,
-
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
-
-                role VARCHAR(30) NOT NULL DEFAULT 'streamer',
-
+                role TEXT NOT NULL DEFAULT 'streamer',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-                CONSTRAINT users_username_length
-                    CHECK (
-                        char_length(username)
-                        BETWEEN 3 AND 50
-                    ),
-
-                CONSTRAINT users_role_check
-                    CHECK (
-                        role IN (
-                            'viewer',
-                            'streamer',
-                            'admin'
-                        )
-                    )
-            );
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
         `);
 
         await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             users_username_lower_unique
-            ON users (
-                LOWER(username)
-            );
+            ON users (LOWER(username))
         `);
 
         await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             users_email_lower_unique
-            ON users (
-                LOWER(email)
-            );
+            ON users (LOWER(email))
         `);
 
-        /* =========================
-           SESSIONS
-        ========================= */
+        /*
+         * SESSIONS
+         */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS sessions (
                 id BIGSERIAL PRIMARY KEY,
-
                 user_id BIGINT NOT NULL
                     REFERENCES users(id)
                     ON DELETE CASCADE,
-
-                token_hash CHAR(64) NOT NULL UNIQUE,
-
+                token_hash TEXT NOT NULL UNIQUE,
                 expires_at TIMESTAMPTZ NOT NULL,
-
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
                 last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+            )
         `);
 
         await client.query(`
             CREATE INDEX IF NOT EXISTS
             sessions_user_id_idx
-            ON sessions(user_id);
+            ON sessions(user_id)
         `);
 
         await client.query(`
             CREATE INDEX IF NOT EXISTS
             sessions_expires_at_idx
-            ON sessions(expires_at);
+            ON sessions(expires_at)
         `);
 
-        /* =========================
-           STREAMERS
-        ========================= */
+        /*
+         * STREAMERS
+         */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS streamers (
                 id BIGSERIAL PRIMARY KEY,
-
-                owner_user_id BIGINT
-                    REFERENCES users(id)
-                    ON DELETE SET NULL,
-
-                username VARCHAR(255) NOT NULL,
-
-                display_name VARCHAR(255) NOT NULL,
-
-                source VARCHAR(50)
-                    NOT NULL DEFAULT 'nerve_account',
-
-                platform VARCHAR(50),
-
-                platform_username VARCHAR(255),
-
-                connected BOOLEAN
-                    NOT NULL DEFAULT FALSE,
-
-                created_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW(),
-
-                updated_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW()
-            );
-        `);
-
-        await client.query(`
-            ALTER TABLE streamers
-            ADD COLUMN IF NOT EXISTS
-            owner_user_id BIGINT
-            REFERENCES users(id)
-            ON DELETE SET NULL
-        `);
-
-        await client.query(`
-            ALTER TABLE streamers
-            ADD COLUMN IF NOT EXISTS
-            platform VARCHAR(50)
-        `);
-
-        await client.query(`
-            ALTER TABLE streamers
-            ADD COLUMN IF NOT EXISTS
-            platform_username VARCHAR(255)
-        `);
-
-        await client.query(`
-            ALTER TABLE streamers
-            ADD COLUMN IF NOT EXISTS
-            connected BOOLEAN
-            NOT NULL DEFAULT FALSE
+                owner_user_id BIGINT,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'nerve_account',
+                platform TEXT,
+                platform_username TEXT,
+                connected BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
         `);
 
         /*
-         * Old streamer rows must NOT remain
-         * permanently "connected".
-         *
-         * Connection now means an active
-         * controller WebSocket session.
+         * Upgrade older databases.
          */
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS owner_user_id BIGINT
+        `);
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS display_name TEXT
+        `);
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS source TEXT
+        `);
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS platform TEXT
+        `);
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS platform_username TEXT
+        `);
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS connected BOOLEAN
+        `);
+
+        await client.query(`
+            UPDATE streamers
+            SET display_name = username
+            WHERE display_name IS NULL
+        `);
+
+        await client.query(`
+            UPDATE streamers
+            SET source = 'nerve_account'
+            WHERE source IS NULL
+        `);
 
         await client.query(`
             UPDATE streamers
             SET connected = FALSE
+            WHERE connected IS NULL
         `);
 
         /*
-         * Existing owner foreign key.
+         * Add FK if it doesn't already exist.
          */
 
-        await client.query(`
-            DO $$
-            BEGIN
+        const fkCheck =
+            await client.query(`
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'streamers_owner_user_fk'
+                LIMIT 1
+            `);
 
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM pg_constraint
-                    WHERE conname =
-                        'streamers_owner_user_fk'
-                ) THEN
-
-                    ALTER TABLE streamers
-                    ADD CONSTRAINT
-                        streamers_owner_user_fk
-                    FOREIGN KEY (owner_user_id)
-                    REFERENCES users(id)
-                    ON DELETE SET NULL;
-
-                END IF;
-
-            END
-            $$;
-        `);
+        if (
+            fkCheck.rows.length === 0
+        ) {
+            await client.query(`
+                ALTER TABLE streamers
+                ADD CONSTRAINT
+                streamers_owner_user_fk
+                FOREIGN KEY (owner_user_id)
+                REFERENCES users(id)
+                ON DELETE SET NULL
+            `);
+        }
 
         await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             streamers_username_lower_unique
-            ON streamers (
-                LOWER(username)
-            );
+            ON streamers (LOWER(username))
         `);
 
         await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
-            streamers_owner_user_unique
+            streamers_owner_unique
             ON streamers(owner_user_id)
-            WHERE owner_user_id IS NOT NULL;
-        `);
-
-        await client.query(`
-            CREATE INDEX IF NOT EXISTS
-            streamers_owner_idx
-            ON streamers(owner_user_id);
+            WHERE owner_user_id IS NOT NULL
         `);
 
         await client.query(`
             CREATE INDEX IF NOT EXISTS
             streamers_connected_idx
-            ON streamers(connected);
+            ON streamers(connected)
         `);
 
-        /* =========================
-           DARES
-        ========================= */
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            streamers_owner_user_idx
+            ON streamers(owner_user_id)
+        `);
+
+        /*
+         * DARES
+         */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS dares (
-                id SERIAL PRIMARY KEY,
-
-                streamer VARCHAR(255) NOT NULL,
-
-                streamer_source VARCHAR(50)
-                    NOT NULL DEFAULT 'nerve_account',
-
-                streamer_id BIGINT
-                    REFERENCES streamers(id)
-                    ON DELETE CASCADE,
-
-                viewer VARCHAR(255)
-                    NOT NULL DEFAULT 'Anonymous',
-
+                id BIGSERIAL PRIMARY KEY,
+                streamer TEXT NOT NULL,
+                streamer_source TEXT NOT NULL DEFAULT 'nerve_account',
+                streamer_id BIGINT,
+                viewer TEXT NOT NULL,
                 dare_text TEXT NOT NULL,
-
                 duration INTEGER NOT NULL,
-
-                reward NUMERIC(12,2)
-                    NOT NULL DEFAULT 0,
-
-                status VARCHAR(30)
-                    NOT NULL DEFAULT 'pending',
-
-                created_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW(),
-
+                reward NUMERIC(12,2) NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 accepted_at TIMESTAMPTZ,
-
-                updated_at TIMESTAMPTZ
-            );
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
         `);
 
         await client.query(`
             ALTER TABLE dares
-            ADD COLUMN IF NOT EXISTS
-            streamer_id BIGINT
-            REFERENCES streamers(id)
-            ON DELETE CASCADE
+            ADD COLUMN IF NOT EXISTS streamer_id BIGINT
+        `);
+
+        await client.query(`
+            ALTER TABLE dares
+            ADD COLUMN IF NOT EXISTS streamer_source TEXT
+        `);
+
+        await client.query(`
+            UPDATE dares
+            SET streamer_source = 'nerve_account'
+            WHERE streamer_source IS NULL
         `);
 
         /*
-         * Backfill old dares using the old
-         * streamer username relationship.
+         * Backfill old dares where possible.
          */
 
         await client.query(`
@@ -949,35 +843,99 @@ async function initializeDatabase() {
                     LOWER(s.username)
         `);
 
+        /*
+         * Add dare FK if missing.
+         */
+
+        const dareFkCheck =
+            await client.query(`
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'dares_streamer_fk'
+                LIMIT 1
+            `);
+
+        if (
+            dareFkCheck.rows.length === 0
+        ) {
+            await client.query(`
+                ALTER TABLE dares
+                ADD CONSTRAINT dares_streamer_fk
+                FOREIGN KEY (streamer_id)
+                REFERENCES streamers(id)
+                ON DELETE CASCADE
+            `);
+        }
+
         await client.query(`
             CREATE INDEX IF NOT EXISTS
-            dares_streamer_id_status_idx
-            ON dares (
+            dares_streamer_id_idx
+            ON dares(streamer_id)
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            dares_status_idx
+            ON dares(status)
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            dares_streamer_status_created_idx
+            ON dares(
                 streamer_id,
-                status
-            );
-        `);
-
-        await client.query(`
-            CREATE INDEX IF NOT EXISTS
-            dares_created_at_idx
-            ON dares(created_at);
-        `);
-
-        await client.query(`
-            CREATE INDEX IF NOT EXISTS
-            dares_legacy_streamer_status_idx
-            ON dares (
-                LOWER(streamer),
-                status
-            );
+                status,
+                created_at
+            )
         `);
 
         /*
-         * Give every existing user a Nerve
-         * streamer profile if they don't have one.
+         * Only one accepted dare per streamer.
          *
-         * Existing streamer rows are preserved.
+         * This index can fail if an old database
+         * already contains duplicate accepted dares.
+         *
+         * We clean those duplicates first.
+         */
+
+        await client.query(`
+            WITH ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY streamer_id
+                        ORDER BY
+                            accepted_at ASC NULLS LAST,
+                            created_at ASC,
+                            id ASC
+                    ) AS rn
+                FROM dares
+                WHERE
+                    status = 'accepted'
+                    AND streamer_id IS NOT NULL
+            )
+            UPDATE dares d
+            SET
+                status = 'pending',
+                accepted_at = NULL,
+                updated_at = NOW()
+            FROM ranked r
+            WHERE
+                d.id = r.id
+                AND r.rn > 1
+        `);
+
+        await client.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            dares_one_active_per_streamer
+            ON dares(streamer_id)
+            WHERE status = 'accepted'
+        `);
+
+        /*
+         * Give every existing user one Nerve
+         * streamer profile.
          */
 
         await client.query(`
@@ -1004,120 +962,122 @@ async function initializeDatabase() {
                 SELECT 1
                 FROM streamers s
                 WHERE LOWER(s.username) =
-                      LOWER(u.username)
+                    LOWER(u.username)
             )
         `);
 
+        await client.query(`
+            UPDATE streamers
+            SET source = 'nerve_account'
+            WHERE owner_user_id IS NOT NULL
+        `);
+
         /*
-         * Mark old streamer records that have
-         * owners as Nerve-account profiles.
+         * On startup nobody should remain
+         * marked as connected.
          */
 
         await client.query(`
             UPDATE streamers
             SET
-                source = 'nerve_account',
+                connected = FALSE,
                 updated_at = NOW()
-            WHERE owner_user_id IS NOT NULL
         `);
 
-        await client.query("COMMIT");
+        /*
+         * Clean expired sessions.
+         */
 
-        console.log(
-            "✅ Database initialized."
-        );
-
-        console.log(
-            "✅ Nerve streamer migration checked."
-        );
-
-    } catch (error) {
-
-        try {
-            await client.query(
-                "ROLLBACK"
-            );
-        } catch (_) {}
-
-        throw error;
-
-    } finally {
-
-        client.release();
-    }
-}
-
-/* =========================================================
-   EXPIRED SESSION CLEANUP
-========================================================= */
-
-async function cleanExpiredSessions() {
-
-    try {
-
-        await pool.query(`
+        await client.query(`
             DELETE FROM sessions
             WHERE expires_at <= NOW()
         `);
 
+        await client.query(
+            "COMMIT"
+        );
+
+        console.log(
+            "✅ PostgreSQL database initialized."
+        );
     } catch (error) {
+        await client.query(
+            "ROLLBACK"
+        );
 
         console.error(
-            "Session cleanup error:",
+            "❌ Database initialization failed:",
             error
         );
+
+        throw error;
+    } finally {
+        client.release();
     }
 }
 
-setInterval(
-    cleanExpiredSessions,
-    60 * 60 * 1000
-);
+/* ============================================================
+   SESSION CLEANUP
+============================================================ */
 
-/* =========================================================
+const sessionCleanup =
+    setInterval(
+        async () => {
+            try {
+                await pool.query(`
+                    DELETE FROM sessions
+                    WHERE expires_at <= NOW()
+                `);
+            } catch (error) {
+                console.error(
+                    "Session cleanup error:",
+                    error
+                );
+            }
+        },
+        60 * 60 * 1000
+    );
+
+if (
+    sessionCleanup.unref
+) {
+    sessionCleanup.unref();
+}
+
+/* ============================================================
    STREAMER HELPERS
-========================================================= */
+============================================================ */
 
 async function getStreamerForUser(
     userId
 ) {
-
     const result =
         await pool.query(
             `
-            SELECT
-                id,
-                owner_user_id,
-                username,
-                display_name,
-                source,
-                platform,
-                platform_username,
-                connected,
-                created_at,
-                updated_at
+            SELECT *
             FROM streamers
             WHERE owner_user_id = $1
+            ORDER BY id ASC
             LIMIT 1
             `,
             [userId]
         );
 
-    return result.rows[0] || null;
+    return (
+        result.rows[0] ||
+        null
+    );
 }
 
 async function getStreamerById(
     streamerId
 ) {
-
     const id =
-        parsePositiveInteger(
-            streamerId
-        );
+        Number(streamerId);
 
     if (
-        id === null ||
-        id === 0
+        !Number.isInteger(id) ||
+        id < 1
     ) {
         return null;
     }
@@ -1125,17 +1085,7 @@ async function getStreamerById(
     const result =
         await pool.query(
             `
-            SELECT
-                id,
-                owner_user_id,
-                username,
-                display_name,
-                source,
-                platform,
-                platform_username,
-                connected,
-                created_at,
-                updated_at
+            SELECT *
             FROM streamers
             WHERE id = $1
             LIMIT 1
@@ -1143,13 +1093,15 @@ async function getStreamerById(
             [id]
         );
 
-    return result.rows[0] || null;
+    return (
+        result.rows[0] ||
+        null
+    );
 }
 
-async function getStreamerByLegacyUsername(
+async function getStreamerByUsername(
     username
 ) {
-
     const normalized =
         normalizeUsername(
             username
@@ -1162,33 +1114,29 @@ async function getStreamerByLegacyUsername(
     const result =
         await pool.query(
             `
-            SELECT
-                id,
-                owner_user_id,
-                username,
-                display_name,
-                source,
-                platform,
-                platform_username,
-                connected,
-                created_at,
-                updated_at
+            SELECT *
             FROM streamers
-            WHERE LOWER(username) = LOWER($1)
+            WHERE LOWER(username) = $1
             LIMIT 1
             `,
             [normalized]
         );
 
-    return result.rows[0] || null;
+    return (
+        result.rows[0] ||
+        null
+    );
 }
 
 function publicStreamer(
     streamer
 ) {
+    if (!streamer) {
+        return null;
+    }
 
     return {
-        id: Number(streamer.id),
+        id: streamer.id,
 
         username:
             streamer.username,
@@ -1196,11 +1144,20 @@ function publicStreamer(
         displayName:
             streamer.display_name,
 
+        display_name:
+            streamer.display_name,
+
+        source:
+            streamer.source,
+
         platform:
-            streamer.platform || null,
+            streamer.platform,
 
         platformUsername:
-            streamer.platform_username || null,
+            streamer.platform_username,
+
+        platform_username:
+            streamer.platform_username,
 
         connected:
             Boolean(
@@ -1209,16 +1166,27 @@ function publicStreamer(
     };
 }
 
-/* =========================================================
+function publicUser(user) {
+    if (!user) {
+        return null;
+    }
+
+    return {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role
+    };
+}
+
+/* ============================================================
    ROOT / HEALTH
-========================================================= */
+============================================================ */
 
 app.get(
     "/",
     async (req, res) => {
-
         try {
-
             const result =
                 await pool.query(`
                     SELECT
@@ -1229,40 +1197,42 @@ app.get(
                         COUNT(*) FILTER (
                             WHERE status = 'pending'
                         ) AS pending_count
-
                     FROM dares
                 `);
 
-            res.json({
+            return res.json({
+                service: "Nerve DARE Backend",
                 status: "online",
-                service: "DARE Backend",
-                identity: "Nerve Account",
                 database: "connected",
+                frontend: FRONTEND_ORIGIN,
 
                 activeDares:
                     Number(
                         result.rows[0]
-                            .active_count || 0
+                            .active_count
                     ),
 
                 pendingDares:
                     Number(
                         result.rows[0]
-                            .pending_count || 0
+                            .pending_count
                     )
             });
-
         } catch (error) {
-
             console.error(
-                "Root health error:",
+                "Root endpoint error:",
                 error
             );
 
-            res.status(503).json({
-                status: "degraded",
-                service: "DARE Backend",
-                database: "error"
+            return res.status(503).json({
+                service:
+                    "Nerve DARE Backend",
+
+                status:
+                    "degraded",
+
+                database:
+                    "unavailable"
             });
         }
     }
@@ -1271,21 +1241,17 @@ app.get(
 app.get(
     "/health",
     async (req, res) => {
-
         try {
-
             await pool.query(
                 "SELECT 1"
             );
 
-            res.json({
+            return res.json({
                 status: "ok",
                 database: "ok"
             });
-
         } catch (error) {
-
-            res.status(503).json({
+            return res.status(503).json({
                 status: "error",
                 database: "error"
             });
@@ -1293,86 +1259,79 @@ app.get(
     }
 );
 
-/* =========================================================
+/* ============================================================
    AUTH — REGISTER
-========================================================= */
+============================================================ */
 
 app.post(
     "/api/auth/register",
     async (req, res) => {
+        const username =
+            normalizeUsername(
+                req.body?.username
+            );
+
+        const email =
+            normalizeEmail(
+                req.body?.email
+            );
+
+        const password =
+            req.body?.password;
+
+        if (
+            !isValidUsername(
+                username
+            )
+        ) {
+            return sendError(
+                res,
+                400,
+                "Username must be 3-50 characters and use only letters, numbers, and underscores.",
+                "INVALID_USERNAME"
+            );
+        }
+
+        if (
+            !isValidEmail(email)
+        ) {
+            return sendError(
+                res,
+                400,
+                "Please enter a valid email address.",
+                "INVALID_EMAIL"
+            );
+        }
+
+        if (
+            !isValidPassword(
+                password
+            )
+        ) {
+            return sendError(
+                res,
+                400,
+                "Password must be between 8 and 128 characters.",
+                "INVALID_PASSWORD"
+            );
+        }
 
         try {
-
-            const username =
-                cleanDisplayUsername(
-                    req.body.username
-                );
-
-            const email =
-                normalizeEmail(
-                    req.body.email
-                );
-
-            const password =
-                req.body.password;
-
-            if (
-                !isValidUsername(
-                    username
-                )
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_USERNAME",
-                    "Username must be 3–50 characters and contain only letters, numbers, and underscores."
-                );
-            }
-
-            if (
-                !isValidEmail(
-                    email
-                )
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_EMAIL",
-                    "Please enter a valid email address."
-                );
-            }
-
-            if (
-                !isValidPassword(
-                    password
-                )
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_PASSWORD",
-                    "Password must be between 8 and 128 characters."
-                );
-            }
-
             const existing =
                 await pool.query(
                     `
                     SELECT
-                        id,
-                        username,
-                        email
-                    FROM users
-                    WHERE
-                        LOWER(username) =
-                            LOWER($1)
-                        OR
-                        LOWER(email) =
-                            LOWER($2)
-                    LIMIT 1
+                        EXISTS (
+                            SELECT 1
+                            FROM users
+                            WHERE LOWER(username) = $1
+                        ) AS username_exists,
+
+                        EXISTS (
+                            SELECT 1
+                            FROM users
+                            WHERE LOWER(email) = $2
+                        ) AS email_exists
                     `,
                     [
                         username,
@@ -1381,31 +1340,26 @@ app.post(
                 );
 
             if (
-                existing.rows.length
+                existing.rows[0]
+                    .username_exists
             ) {
-
-                const row =
-                    existing.rows[0];
-
-                if (
-                    row.username
-                        .toLowerCase() ===
-                    username.toLowerCase()
-                ) {
-
-                    return sendError(
-                        res,
-                        409,
-                        "USERNAME_TAKEN",
-                        "That username is already taken."
-                    );
-                }
-
                 return sendError(
                     res,
                     409,
-                    "EMAIL_TAKEN",
-                    "That email is already registered."
+                    "That username is already taken.",
+                    "USERNAME_EXISTS"
+                );
+            }
+
+            if (
+                existing.rows[0]
+                    .email_exists
+            ) {
+                return sendError(
+                    res,
+                    409,
+                    "An account with that email already exists.",
+                    "EMAIL_EXISTS"
                 );
             }
 
@@ -1418,10 +1372,10 @@ app.post(
                 await pool.connect();
 
             let user;
+
             let streamer;
 
             try {
-
                 await client.query(
                     "BEGIN"
                 );
@@ -1445,8 +1399,7 @@ app.post(
                             id,
                             username,
                             email,
-                            role,
-                            created_at
+                            role
                         `,
                         [
                             username,
@@ -1458,11 +1411,6 @@ app.post(
                 user =
                     userResult.rows[0];
 
-                /*
-                 * Every Nerve account automatically
-                 * gets its own streamer profile.
-                 */
-
                 const streamerResult =
                     await client.query(
                         `
@@ -1471,31 +1419,25 @@ app.post(
                             username,
                             display_name,
                             source,
-                            platform,
-                            platform_username,
                             connected
                         )
                         VALUES (
                             $1,
                             $2,
-                            $2,
+                            $3,
                             'nerve_account',
-                            NULL,
-                            NULL,
                             FALSE
                         )
-                        RETURNING
-                            id,
-                            username,
-                            display_name,
-                            source,
-                            platform,
-                            platform_username,
-                            connected
+                        RETURNING *
                         `,
                         [
                             user.id,
-                            username
+                            username,
+                            cleanDisplayUsername(
+                                req.body
+                                    ?.displayName ||
+                                username
+                            )
                         ]
                     );
 
@@ -1505,109 +1447,55 @@ app.post(
                 await client.query(
                     "COMMIT"
                 );
-
             } catch (error) {
-
-                try {
-                    await client.query(
-                        "ROLLBACK"
-                    );
-                } catch (_) {}
+                await client.query(
+                    "ROLLBACK"
+                );
 
                 throw error;
-
             } finally {
-
                 client.release();
             }
 
-            /* =========================
-               AUTO LOGIN
-            ========================= */
-
-            const token =
-                generateSessionToken();
-
-            const tokenHash =
-                hashSessionToken(
-                    token
+            const sessionToken =
+                await createSession(
+                    user.id
                 );
 
-            await pool.query(
-                `
-                INSERT INTO sessions (
-                    user_id,
-                    token_hash,
-                    expires_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    NOW() + ($3 * INTERVAL '1 day')
-                )
-                `,
-                [
-                    user.id,
-                    tokenHash,
-                    SESSION_DAYS
-                ]
-            );
-
-            setSessionCookie(
+            appendSessionCookie(
                 res,
-                token
+                sessionToken,
+                Math.floor(
+                    SESSION_TTL_MS /
+                    1000
+                )
             );
 
             return res.status(201).json({
                 success: true,
 
                 data: {
+                    user:
+                        publicUser(
+                            user
+                        ),
 
-                    user: {
-                        id:
-                            user.id,
+                    streamer:
+                        publicStreamer(
+                            streamer
+                        ),
 
-                        username:
-                            user.username,
-
-                        email:
-                            user.email,
-
-                        role:
-                            user.role
-                    },
-
-                    streamer: {
-                        id:
-                            Number(
-                                streamer.id
-                            ),
-
-                        username:
-                            streamer.username,
-
-                        displayName:
-                            streamer.display_name,
-
-                        platform:
-                            streamer.platform,
-
-                        platformUsername:
-                            streamer.platform_username,
-
-                        connected:
-                            streamer.connected
-                    },
-
-                    sessionToken:
-                        token
+                    /*
+                     * The current frontend stores
+                     * this in localStorage and uses it
+                     * for WebSocket AUTH.
+                     */
+                    sessionToken
                 }
             });
-
         } catch (error) {
-
             console.error(
-                "Registration error:",
+                "Register error:",
                 error
             );
 
@@ -1615,56 +1503,63 @@ app.post(
                 error.code ===
                 "23505"
             ) {
-
                 return sendError(
                     res,
                     409,
-                    "ACCOUNT_EXISTS",
-                    "An account with that username or email already exists."
+                    "Username or email is already in use.",
+                    "ACCOUNT_EXISTS"
                 );
             }
 
             return sendError(
                 res,
                 500,
-                "REGISTER_FAILED",
-                "Could not create your account."
+                "Unable to create your account."
             );
         }
     }
 );
 
-/* =========================================================
+/* ============================================================
    AUTH — LOGIN
-========================================================= */
+============================================================ */
 
 app.post(
     "/api/auth/login",
     async (req, res) => {
+        const email =
+            normalizeEmail(
+                req.body?.email
+            );
+
+        const password =
+            req.body?.password;
+
+        if (
+            !isValidEmail(email)
+        ) {
+            return sendError(
+                res,
+                400,
+                "Please enter a valid email address.",
+                "INVALID_EMAIL"
+            );
+        }
+
+        if (
+            typeof password !==
+                "string" ||
+            password.length < 1
+        ) {
+            return sendError(
+                res,
+                400,
+                "Password is required.",
+                "PASSWORD_REQUIRED"
+            );
+        }
 
         try {
-
-            const email =
-                normalizeEmail(
-                    req.body.email
-                );
-
-            const password =
-                req.body.password;
-
-            if (
-                !email ||
-                !password
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "MISSING_CREDENTIALS",
-                    "Email and password are required."
-                );
-            }
-
             const result =
                 await pool.query(
                     `
@@ -1675,8 +1570,7 @@ app.post(
                         password_hash,
                         role
                     FROM users
-                    WHERE LOWER(email) =
-                        LOWER($1)
+                    WHERE LOWER(email) = $1
                     LIMIT 1
                     `,
                     [email]
@@ -1685,167 +1579,116 @@ app.post(
             if (
                 result.rows.length === 0
             ) {
-
                 return sendError(
                     res,
                     401,
-                    "INVALID_CREDENTIALS",
-                    "Invalid email or password."
+                    "Invalid email or password.",
+                    "INVALID_LOGIN"
                 );
             }
 
             const user =
                 result.rows[0];
 
-            const valid =
+            const passwordCorrect =
                 await verifyPassword(
                     password,
                     user.password_hash
                 );
 
-            if (!valid) {
-
+            if (!passwordCorrect) {
                 return sendError(
                     res,
                     401,
-                    "INVALID_CREDENTIALS",
-                    "Invalid email or password."
+                    "Invalid email or password.",
+                    "INVALID_LOGIN"
                 );
             }
-
-            /*
-             * Ensure older accounts have a
-             * Nerve streamer profile.
-             */
 
             let streamer =
                 await getStreamerForUser(
                     user.id
                 );
 
+            /*
+             * Repair accounts created before
+             * automatic streamer profiles existed.
+             */
+
             if (!streamer) {
+                try {
+                    const insert =
+                        await pool.query(
+                            `
+                            INSERT INTO streamers (
+                                owner_user_id,
+                                username,
+                                display_name,
+                                source,
+                                connected
+                            )
+                            VALUES (
+                                $1,
+                                $2,
+                                $3,
+                                'nerve_account',
+                                FALSE
+                            )
+                            ON CONFLICT DO NOTHING
+                            RETURNING *
+                            `,
+                            [
+                                user.id,
+                                user.username,
+                                user.username
+                            ]
+                        );
 
-                const streamerResult =
-                    await pool.query(
-                        `
-                        INSERT INTO streamers (
-                            owner_user_id,
-                            username,
-                            display_name,
-                            source,
-                            connected
-                        )
-                        VALUES (
-                            $1,
-                            $2,
-                            $2,
-                            'nerve_account',
-                            FALSE
-                        )
-                        ON CONFLICT DO NOTHING
-                        RETURNING *
-                        `,
-                        [
-                            user.id,
-                            user.username
-                        ]
+                    streamer =
+                        insert.rows[0] ||
+                        await getStreamerForUser(
+                            user.id
+                        );
+                } catch (error) {
+                    console.error(
+                        "Streamer profile repair error:",
+                        error
                     );
-
-                streamer =
-                    streamerResult.rows[0] ||
-                    await getStreamerForUser(
-                        user.id
-                    );
+                }
             }
 
-            const token =
-                generateSessionToken();
-
-            const tokenHash =
-                hashSessionToken(
-                    token
+            const sessionToken =
+                await createSession(
+                    user.id
                 );
 
-            await pool.query(
-                `
-                INSERT INTO sessions (
-                    user_id,
-                    token_hash,
-                    expires_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    NOW() + ($3 * INTERVAL '1 day')
-                )
-                `,
-                [
-                    user.id,
-                    tokenHash,
-                    SESSION_DAYS
-                ]
-            );
-
-            setSessionCookie(
+            appendSessionCookie(
                 res,
-                token
+                sessionToken,
+                Math.floor(
+                    SESSION_TTL_MS /
+                    1000
+                )
             );
 
             return res.json({
                 success: true,
 
                 data: {
-
-                    user: {
-                        id:
-                            user.id,
-
-                        username:
-                            user.username,
-
-                        email:
-                            user.email,
-
-                        role:
-                            user.role
-                    },
+                    user:
+                        publicUser(
+                            user
+                        ),
 
                     streamer:
-                        streamer
-                            ? {
-                                id:
-                                    Number(
-                                        streamer.id
-                                    ),
+                        publicStreamer(
+                            streamer
+                        ),
 
-                                username:
-                                    streamer.username,
-
-                                displayName:
-                                    streamer.display_name,
-
-                                platform:
-                                    streamer.platform ||
-                                    null,
-
-                                platformUsername:
-                                    streamer.platform_username ||
-                                    null,
-
-                                connected:
-                                    Boolean(
-                                        streamer.connected
-                                    )
-                            }
-                            : null,
-
-                    sessionToken:
-                        token
+                    sessionToken
                 }
             });
-
         } catch (error) {
-
             console.error(
                 "Login error:",
                 error
@@ -1854,273 +1697,145 @@ app.post(
             return sendError(
                 res,
                 500,
-                "LOGIN_FAILED",
-                "Could not log you in."
+                "Unable to log in."
             );
         }
     }
 );
 
-/* =========================================================
-   AUTH — CURRENT USER
-========================================================= */
+/* ============================================================
+   AUTH — ME
+============================================================ */
 
 app.get(
     "/api/auth/me",
-    authenticateRequest,
-    (req, res) => {
-
-        if (!req.user) {
-
-            return sendError(
-                res,
-                401,
-                "AUTH_REQUIRED",
-                "You are not logged in."
-            );
-        }
-
-        return res.json({
-            success: true,
-
-            data: {
-
-                user: {
-                    id:
-                        req.user.id,
-
-                    username:
-                        req.user.username,
-
-                    email:
-                        req.user.email,
-
-                    role:
-                        req.user.role
-                }
-            }
-        });
-    }
-);
-
-/* =========================================================
-   AUTH — LOGOUT
-========================================================= */
-
-app.post(
-    "/api/auth/logout",
-    authenticateRequest,
     async (req, res) => {
-
         try {
-
-            if (
-                req.user?.sessionId
-            ) {
-
-                await pool.query(
-                    `
-                    DELETE FROM sessions
-                    WHERE id = $1
-                    `,
-                    [
-                        req.user.sessionId
-                    ]
-                );
-            }
-
-            clearSessionCookie(
-                res
-            );
-
-            return res.json({
-                success: true
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Logout error:",
-                error
-            );
-
-            clearSessionCookie(
-                res
-            );
-
-            return res.json({
-                success: true
-            });
-        }
-    }
-);
-
-/* =========================================================
-   AUTH — LOGOUT ALL
-========================================================= */
-
-app.post(
-    "/api/auth/logout-all",
-    authenticateRequest,
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            await pool.query(
-                `
-                DELETE FROM sessions
-                WHERE user_id = $1
-                `,
-                [
-                    req.user.id
-                ]
-            );
-
-            clearSessionCookie(
-                res
-            );
-
-            return res.json({
-                success: true
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Logout-all error:",
-                error
-            );
-
-            return sendError(
-                res,
-                500,
-                "LOGOUT_FAILED",
-                "Could not log out all sessions."
-            );
-        }
-    }
-);
-
-/* =========================================================
-   STREAMERS — PUBLIC
-========================================================= */
-
-app.get(
-    "/api/streamers",
-    async (req, res) => {
-
-        try {
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        username,
-                        display_name,
-                        platform,
-                        platform_username,
-                        connected
-                    FROM streamers
-                    WHERE connected = TRUE
-                    ORDER BY
-                        LOWER(display_name)
-                    `
+            const user =
+                await authenticateRequest(
+                    req,
+                    res
                 );
 
-            return res.json({
-                streamers:
-                    result.rows.map(
-                        publicStreamer
-                    )
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Streamer lookup error:",
-                error
-            );
-
-            return sendError(
-                res,
-                500,
-                "STREAMERS_FAILED",
-                "Could not load streamers."
-            );
-        }
-    }
-);
-
-/* =========================================================
-   STREAMER — MY STREAMER
-========================================================= */
-
-app.get(
-    "/api/my-streamer",
-    authenticateRequest,
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            const streamer =
-                await getStreamerForUser(
-                    req.user.id
-                );
-
-            if (!streamer) {
-
+            if (!user) {
                 return sendError(
                     res,
-                    404,
-                    "STREAMER_NOT_FOUND",
-                    "Your streamer profile was not found."
+                    401,
+                    "Not authenticated.",
+                    "NOT_AUTHENTICATED"
                 );
             }
 
             return res.json({
                 success: true,
-                streamer:
-                    publicStreamer(
-                        streamer
-                    )
+
+                data: {
+                    user:
+                        publicUser(
+                            user
+                        )
+                }
             });
-
         } catch (error) {
-
             console.error(
-                "My streamer error:",
+                "Auth me error:",
                 error
             );
 
             return sendError(
                 res,
                 500,
-                "STREAMER_FAILED",
-                "Could not load your streamer profile."
+                "Unable to check authentication."
             );
         }
     }
 );
 
-/* =========================================================
-   STREAMER — MY STREAMERS
-   KEPT FOR FRONTEND COMPATIBILITY
-========================================================= */
+/* ============================================================
+   AUTH — LOGOUT
+============================================================ */
 
-app.get(
-    "/api/my-streamers",
-    authenticateRequest,
-    requireAuth,
+app.post(
+    "/api/auth/logout",
     async (req, res) => {
-
         try {
+            const user =
+                await authenticateRequest(
+                    req,
+                    res
+                );
 
-            const result =
+            if (user?.sessionId) {
                 await pool.query(
                     `
+                    DELETE FROM sessions
+                    WHERE id = $1
+                    `,
+                    [user.sessionId]
+                );
+            }
+        } catch (error) {
+            console.warn(
+                "Logout cleanup error:",
+                error
+            );
+        }
+
+        clearSessionCookie(res);
+
+        return res.json({
+            success: true
+        });
+    }
+);
+
+/* ============================================================
+   AUTH — LOGOUT ALL
+============================================================ */
+
+app.post(
+    "/api/auth/logout-all",
+    requireAuth,
+    async (req, res) => {
+        try {
+            await pool.query(
+                `
+                DELETE FROM sessions
+                WHERE user_id = $1
+                `,
+                [req.user.id]
+            );
+
+            clearSessionCookie(res);
+
+            return res.json({
+                success: true
+            });
+        } catch (error) {
+            console.error(
+                "Logout all error:",
+                error
+            );
+
+            return sendError(
+                res,
+                500,
+                "Unable to log out all sessions."
+            );
+        }
+    }
+);
+
+/* ============================================================
+   PUBLIC STREAMERS
+============================================================ */
+
+app.get(
+    "/api/streamers",
+    async (req, res) => {
+        try {
+            const result =
+                await pool.query(`
                     SELECT
                         id,
                         username,
@@ -2130,51 +1845,121 @@ app.get(
                         platform_username,
                         connected
                     FROM streamers
-                    WHERE owner_user_id = $1
+                    WHERE connected = TRUE
                     ORDER BY
-                        LOWER(display_name)
-                    `,
-                    [
-                        req.user.id
-                    ]
+                        LOWER(display_name),
+                        id
+                `);
+
+            return res.json({
+                success: true,
+
+                data: {
+                    streamers:
+                        result.rows.map(
+                            publicStreamer
+                        )
+                },
+
+                streamers:
+                    result.rows.map(
+                        publicStreamer
+                    )
+            });
+        } catch (error) {
+            console.error(
+                "Public streamers error:",
+                error
+            );
+
+            return sendError(
+                res,
+                500,
+                "Unable to load streamers."
+            );
+        }
+    }
+);
+
+/* ============================================================
+   MY STREAMER
+============================================================ */
+
+app.get(
+    "/api/my-streamer",
+    requireAuth,
+    async (req, res) => {
+        try {
+            const streamer =
+                await getStreamerForUser(
+                    req.user.id
                 );
 
             return res.json({
-                streamers:
-                    result.rows.map(
-                        streamer => ({
-                            id:
-                                Number(
-                                    streamer.id
-                                ),
+                success: true,
 
-                            username:
-                                streamer.username,
+                data: {
+                    streamer:
+                        publicStreamer(
+                            streamer
+                        )
+                },
 
-                            displayName:
-                                streamer.display_name,
-
-                            source:
-                                streamer.source,
-
-                            platform:
-                                streamer.platform ||
-                                null,
-
-                            platformUsername:
-                                streamer.platform_username ||
-                                null,
-
-                            connected:
-                                Boolean(
-                                    streamer.connected
-                                )
-                        })
+                streamer:
+                    publicStreamer(
+                        streamer
                     )
             });
-
         } catch (error) {
+            console.error(
+                "My streamer error:",
+                error
+            );
 
+            return sendError(
+                res,
+                500,
+                "Unable to load your streamer profile."
+            );
+        }
+    }
+);
+
+/* ============================================================
+   MY STREAMERS
+============================================================ */
+
+app.get(
+    "/api/my-streamers",
+    requireAuth,
+    async (req, res) => {
+        try {
+            const result =
+                await pool.query(
+                    `
+                    SELECT *
+                    FROM streamers
+                    WHERE owner_user_id = $1
+                    ORDER BY id ASC
+                    `,
+                    [req.user.id]
+                );
+
+            const streamers =
+                result.rows.map(
+                    publicStreamer
+                );
+
+            return res.json({
+                success: true,
+
+                data: {
+                    streamers
+                },
+
+                streamers
+            });
+        } catch (error) {
             console.error(
                 "My streamers error:",
                 error
@@ -2183,48 +1968,293 @@ app.get(
             return sendError(
                 res,
                 500,
-                "STREAMERS_FAILED",
-                "Could not load your streamers."
+                "Unable to load your streamer profiles."
             );
         }
     }
 );
 
-/* =========================================================
-   STREAMER — UPDATE PLATFORM
-========================================================= */
+/* ============================================================
+   UPDATE MY STREAMER
+   PATCH /api/my-streamer
+============================================================ */
+
+app.patch(
+    "/api/my-streamer",
+    requireAuth,
+    async (req, res) => {
+        try {
+            const streamer =
+                await getStreamerForUser(
+                    req.user.id
+                );
+
+            if (!streamer) {
+                return sendError(
+                    res,
+                    404,
+                    "Streamer profile not found.",
+                    "STREAMER_NOT_FOUND"
+                );
+            }
+
+            const body =
+                req.body || {};
+
+            /*
+             * Existing frontend may send any
+             * of these forms.
+             */
+
+            let displayName =
+                body.displayName ??
+                body.display_name;
+
+            let platform =
+                body.platform;
+
+            let platformUsername =
+                body.platformUsername ??
+                body.platform_username;
+
+            let username =
+                body.username;
+
+            /*
+             * Only update values actually supplied.
+             */
+
+            displayName =
+                displayName !==
+                undefined
+                    ? cleanDisplayUsername(
+                        displayName
+                    )
+                    : streamer.display_name;
+
+            if (
+                !displayName
+            ) {
+                displayName =
+                    streamer.username;
+            }
+
+            if (
+                platform !==
+                undefined
+            ) {
+                platform =
+                    normalizePlatform(
+                        platform
+                    );
+
+                if (
+                    body.platform &&
+                    !platform
+                ) {
+                    return sendError(
+                        res,
+                        400,
+                        "Invalid platform.",
+                        "INVALID_PLATFORM"
+                    );
+                }
+            } else {
+                platform =
+                    streamer.platform;
+            }
+
+            if (
+                platformUsername !==
+                undefined
+            ) {
+                platformUsername =
+                    cleanText(
+                        platformUsername,
+                        100
+                    );
+
+                if (
+                    !platformUsername
+                ) {
+                    platformUsername =
+                        null;
+                }
+            } else {
+                platformUsername =
+                    streamer.platform_username;
+            }
+
+            /*
+             * Username is the Nerve streamer username.
+             * Keep it tied to the Nerve account unless
+             * the frontend explicitly requests a change.
+             */
+
+            if (
+                username !==
+                undefined
+            ) {
+                username =
+                    normalizeUsername(
+                        username
+                    );
+
+                if (
+                    !isValidUsername(
+                        username
+                    )
+                ) {
+                    return sendError(
+                        res,
+                        400,
+                        "Invalid streamer username.",
+                        "INVALID_USERNAME"
+                    );
+                }
+
+                const conflict =
+                    await pool.query(
+                        `
+                        SELECT id
+                        FROM streamers
+                        WHERE
+                            LOWER(username) = $1
+                            AND id <> $2
+                        LIMIT 1
+                        `,
+                        [
+                            username,
+                            streamer.id
+                        ]
+                    );
+
+                if (
+                    conflict.rows.length
+                ) {
+                    return sendError(
+                        res,
+                        409,
+                        "That streamer username is already in use.",
+                        "STREAMER_USERNAME_EXISTS"
+                    );
+                }
+            } else {
+                username =
+                    streamer.username;
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE streamers
+                    SET
+                        username = $1,
+                        display_name = $2,
+                        platform = $3,
+                        platform_username = $4,
+                        updated_at = NOW()
+                    WHERE
+                        id = $5
+                        AND owner_user_id = $6
+                    RETURNING *
+                    `,
+                    [
+                        username,
+                        displayName,
+                        platform,
+                        platformUsername,
+                        streamer.id,
+                        req.user.id
+                    ]
+                );
+
+            const updated =
+                result.rows[0];
+
+            return res.json({
+                success: true,
+
+                data: {
+                    streamer:
+                        publicStreamer(
+                            updated
+                        )
+                },
+
+                streamer:
+                    publicStreamer(
+                        updated
+                    )
+            });
+        } catch (error) {
+            console.error(
+                "Update streamer error:",
+                error
+            );
+
+            if (
+                error.code ===
+                "23505"
+            ) {
+                return sendError(
+                    res,
+                    409,
+                    "That streamer username is already in use.",
+                    "STREAMER_USERNAME_EXISTS"
+                );
+            }
+
+            return sendError(
+                res,
+                500,
+                "Unable to update streamer profile."
+            );
+        }
+    }
+);
+
+/* ============================================================
+   UPDATE PLATFORM
+============================================================ */
 
 app.post(
     "/api/my-streamer/platform",
-    authenticateRequest,
     requireAuth,
     async (req, res) => {
-
         try {
-
             const platform =
                 normalizePlatform(
-                    req.body.platform
+                    req.body?.platform
                 );
 
             const platformUsername =
                 cleanText(
-                    req.body.platformUsername ||
-                    req.body.platform_username ||
-                    "",
-                    255
-                ) || null;
+                    req.body?.platformUsername ??
+                    req.body?.platform_username,
+                    100
+                );
 
-            if (
-                req.body.platform &&
-                !platform
-            ) {
-
+            if (!platform) {
                 return sendError(
                     res,
                     400,
-                    "INVALID_PLATFORM",
-                    "Invalid streaming platform."
+                    "Invalid platform.",
+                    "INVALID_PLATFORM"
+                );
+            }
+
+            const streamer =
+                await getStreamerForUser(
+                    req.user.id
+                );
+
+            if (!streamer) {
+                return sendError(
+                    res,
+                    404,
+                    "Streamer profile not found.",
+                    "STREAMER_NOT_FOUND"
                 );
             }
 
@@ -2236,40 +2266,31 @@ app.post(
                         platform = $1,
                         platform_username = $2,
                         updated_at = NOW()
-                    WHERE owner_user_id = $3
-                    RETURNING
-                        *
+                    WHERE
+                        id = $3
+                        AND owner_user_id = $4
+                    RETURNING *
                     `,
                     [
                         platform,
-                        platformUsername,
+                        platformUsername ||
+                            null,
+                        streamer.id,
                         req.user.id
                     ]
                 );
 
-            if (
-                result.rows.length === 0
-            ) {
-
-                return sendError(
-                    res,
-                    404,
-                    "STREAMER_NOT_FOUND",
-                    "Your streamer profile was not found."
-                );
-            }
-
             return res.json({
                 success: true,
 
-                streamer:
-                    publicStreamer(
-                        result.rows[0]
-                    )
+                data: {
+                    streamer:
+                        publicStreamer(
+                            result.rows[0]
+                        )
+                }
             });
-
         } catch (error) {
-
             console.error(
                 "Platform update error:",
                 error
@@ -2278,91 +2299,75 @@ app.post(
             return sendError(
                 res,
                 500,
-                "PLATFORM_UPDATE_FAILED",
-                "Could not update your streaming platform."
+                "Unable to update platform."
             );
         }
     }
 );
 
-/* =========================================================
-   STREAMER OWNERSHIP
-========================================================= */
+/* ============================================================
+   DARE FORMATTER
+============================================================ */
 
-async function userOwnsStreamerId(
-    userId,
-    streamerId
+function formatDare(
+    row
 ) {
-
-    const id =
-        parsePositiveInteger(
-            streamerId
-        );
-
-    if (
-        id === null ||
-        id === 0
-    ) {
-        return false;
+    if (!row) {
+        return null;
     }
 
-    const result =
-        await pool.query(
-            `
-            SELECT id
-            FROM streamers
-            WHERE
-                id = $1
-                AND owner_user_id = $2
-            LIMIT 1
-            `,
-            [
-                id,
-                userId
-            ]
-        );
+    const streamerId =
+        row.streamer_id ??
+        row.streamerId ??
+        null;
 
-    return result.rows.length > 0;
-}
+    const streamerUsername =
+        row.streamer ||
+        row.streamer_username ||
+        "";
 
-/* =========================================================
-   DARE FORMATTER
-========================================================= */
+    const streamerDisplayName =
+        row.streamer_display_name ||
+        row.streamer_displayName ||
+        streamerUsername;
 
-function formatDare(row) {
+    const platform =
+        row.platform ||
+        null;
+
+    const platformUsername =
+        row.platform_username ||
+        null;
 
     return {
-        id:
-            Number(row.id),
+        id: row.id,
 
-        streamerId:
-            row.streamer_id !== null &&
-            row.streamer_id !== undefined
-                ? Number(
-                    row.streamer_id
-                )
-                : null,
+        streamerId,
+
+        streamer_id:
+            streamerId,
 
         streamer:
-            row.streamer,
+            streamerUsername,
 
-        streamerDisplayName:
-            row.streamer_display_name ||
-            row.streamer,
+        streamerUsername,
+
+        streamerDisplayName,
 
         streamer_source:
-            row.streamer_source,
+            row.streamer_source ||
+            "nerve_account",
 
         streamerSource:
-            row.streamer_source,
+            row.streamer_source ||
+            "nerve_account",
 
-        platform:
-            row.platform ||
-            null,
+        platform,
 
-        platformUsername:
-            row.platform_username ||
-            null,
+        platformUsername,
+
+        platform_username:
+            platformUsername,
 
         viewer:
             row.viewer,
@@ -2380,7 +2385,7 @@ function formatDare(row) {
             Number(row.duration),
 
         reward:
-            Number(row.reward),
+            Number(row.reward || 0),
 
         status:
             row.status,
@@ -2398,61 +2403,72 @@ function formatDare(row) {
             row.accepted_at,
 
         updated_at:
+            row.updated_at,
+
+        updatedAt:
             row.updated_at
     };
 }
 
-/* =========================================================
-   GET DARE STATE
-========================================================= */
+/* ============================================================
+   GET ALL DARE STATE
+============================================================ */
 
 async function getAllDareState() {
-
     const result =
-        await pool.query(
-            `
+        await pool.query(`
             SELECT
-                d.id,
-                d.streamer_id,
-                d.streamer,
-                d.streamer_source,
-                d.viewer,
-                d.dare_text,
-                d.duration,
-                d.reward,
-                d.status,
-                d.created_at,
-                d.accepted_at,
-                d.updated_at,
+                d.*,
 
-                s.display_name AS streamer_display_name,
+                s.username
+                    AS streamer_username,
+
+                s.display_name
+                    AS streamer_display_name,
+
                 s.platform,
-                s.platform_username
+
+                s.platform_username,
+
+                s.connected
+                    AS streamer_connected
 
             FROM dares d
 
             LEFT JOIN streamers s
                 ON s.id = d.streamer_id
 
-            WHERE d.status IN (
-                'pending',
-                'accepted'
-            )
+            WHERE
+                d.status IN (
+                    'pending',
+                    'accepted'
+                )
 
             ORDER BY
-                d.created_at ASC
-            `
-        );
+                d.created_at ASC,
+                d.id ASC
+        `);
 
-    const activeDares = {};
+    const active = {};
+
+    const activeDares = [];
+
     const queues = {};
 
     for (
         const row of result.rows
     ) {
-
         const dare =
-            formatDare(row);
+            formatDare({
+                ...row,
+
+                streamer:
+                    row.streamer_username ||
+                    row.streamer,
+
+                streamer_display_name:
+                    row.streamer_display_name
+            });
 
         const key =
             row.streamer_id !== null &&
@@ -2468,16 +2484,18 @@ async function getAllDareState() {
             row.status ===
             "accepted"
         ) {
-
-            activeDares[key] =
+            active[key] =
                 dare;
+
+            activeDares.push(
+                dare
+            );
         }
 
         if (
             row.status ===
             "pending"
         ) {
-
             if (!queues[key]) {
                 queues[key] = [];
             }
@@ -2489,118 +2507,187 @@ async function getAllDareState() {
     }
 
     return {
+        active,
         activeDares,
         queues
     };
 }
 
-/* =========================================================
-   WEBSOCKET
-========================================================= */
+/* ============================================================
+   BROADCAST
+============================================================ */
 
 const wss =
     new WebSocket.Server({
-        server,
-        path: "/ws"
+        noServer: true
     });
 
-/*
- * Number of active controller connections
- * for each Nerve streamer.
- *
- * Multiple tabs/devices can control the
- * same account without incorrectly marking
- * the streamer offline.
- */
+function broadcast(
+    message
+) {
+    const payload =
+        JSON.stringify(message);
+
+    for (
+        const socket of wss.clients
+    ) {
+        if (
+            socket.readyState ===
+            WebSocket.OPEN
+        ) {
+            try {
+                socket.send(
+                    payload
+                );
+            } catch (error) {
+                console.warn(
+                    "WebSocket send error:",
+                    error
+                );
+            }
+        }
+    }
+}
+
+async function sendState(
+    socket
+) {
+    try {
+        const state =
+            await getAllDareState();
+
+        const streamersResult =
+            await pool.query(`
+                SELECT
+                    id,
+                    username,
+                    display_name,
+                    source,
+                    platform,
+                    platform_username,
+                    connected
+                FROM streamers
+                ORDER BY
+                    LOWER(display_name),
+                    id
+            `);
+
+        const streamers =
+            streamersResult.rows.map(
+                publicStreamer
+            );
+
+        const message = {
+            type: "STATE",
+
+            active:
+                state.active,
+
+            activeDares:
+                state.activeDares,
+
+            queues:
+                state.queues,
+
+            streamers
+        };
+
+        if (
+            socket.readyState ===
+            WebSocket.OPEN
+        ) {
+            socket.send(
+                JSON.stringify(
+                    message
+                )
+            );
+        }
+    } catch (error) {
+        console.error(
+            "sendState error:",
+            error
+        );
+    }
+}
+
+/* ============================================================
+   STREAMER CONNECTION STATUS
+============================================================ */
 
 const controllerConnections =
     new Map();
-
-function getConnectionCount(
-    streamerId
-) {
-    return (
-        controllerConnections.get(
-            String(streamerId)
-        ) || 0
-    );
-}
 
 async function setStreamerConnected(
     streamerId,
     connected
 ) {
+    try {
+        await pool.query(
+            `
+            UPDATE streamers
+            SET
+                connected = $1,
+                updated_at = NOW()
+            WHERE id = $2
+            `,
+            [
+                connected,
+                streamerId
+            ]
+        );
 
-    await pool.query(
-        `
-        UPDATE streamers
-        SET
-            connected = $1,
-            updated_at = NOW()
-        WHERE id = $2
-        `,
-        [
-            connected,
+        broadcast({
+            type:
+                connected
+                    ? "STREAMER_CONNECTED"
+                    : "STREAMER_DISCONNECTED",
+
             streamerId
-        ]
-    );
+        });
+    } catch (error) {
+        console.error(
+            "Streamer connection update error:",
+            error
+        );
+    }
 }
 
 async function addControllerConnection(
     streamerId
 ) {
-
     const key =
         String(streamerId);
 
-    const current =
-        getConnectionCount(
-            streamerId
-        );
+    const count =
+        controllerConnections.get(
+            key
+        ) || 0;
 
     controllerConnections.set(
         key,
-        current + 1
+        count + 1
     );
 
-    if (current === 0) {
-
+    if (count === 0) {
         await setStreamerConnected(
             streamerId,
             true
         );
-
-        broadcast({
-            type:
-                "STREAMER_CONNECTED",
-
-            streamerId:
-                Number(streamerId)
-        });
     }
 }
 
 async function removeControllerConnection(
     streamerId
 ) {
-
-    if (
-        streamerId === null ||
-        streamerId === undefined
-    ) {
-        return;
-    }
-
     const key =
         String(streamerId);
 
-    const current =
-        getConnectionCount(
-            streamerId
-        );
+    const count =
+        controllerConnections.get(
+            key
+        ) || 0;
 
-    if (current <= 1) {
-
+    if (count <= 1) {
         controllerConnections.delete(
             key
         );
@@ -2610,287 +2697,87 @@ async function removeControllerConnection(
             false
         );
 
-        broadcast({
-            type:
-                "STREAMER_DISCONNECTED",
-
-            streamerId:
-                Number(streamerId)
-        });
-
         return;
     }
 
     controllerConnections.set(
         key,
-        current - 1
+        count - 1
     );
 }
 
-/* =========================================================
-   BROADCAST
-========================================================= */
+/* ============================================================
+   WEBSOCKET
+============================================================ */
 
-function broadcast(message) {
+server.on(
+    "upgrade",
+    (request, socket, head) => {
+        const origin =
+            request.headers.origin;
 
-    const data =
-        JSON.stringify(message);
-
-    wss.clients.forEach(
-        client => {
-
-            if (
-                client.readyState ===
-                WebSocket.OPEN
-            ) {
-
-                try {
-
-                    client.send(
-                        data
-                    );
-
-                } catch (error) {
-
-                    console.error(
-                        "WebSocket send error:",
-                        error
-                    );
-                }
-            }
-        }
-    );
-}
-
-/* =========================================================
-   SEND CURRENT STATE
-========================================================= */
-
-async function sendState(
-    socket
-) {
-
-    try {
-
-        const state =
-            await getAllDareState();
-
-        const streamers =
-            await pool.query(
-                `
-                SELECT
-                    id,
-                    username,
-                    display_name,
-                    platform,
-                    platform_username,
-                    connected
-                FROM streamers
-                WHERE connected = TRUE
-                ORDER BY
-                    LOWER(display_name)
-                `
-            );
+        /*
+         * Allow the configured frontend.
+         *
+         * Some OBS/browser overlay environments
+         * may omit Origin, so only reject when
+         * an Origin is actually supplied.
+         */
 
         if (
-            socket.readyState !==
-            WebSocket.OPEN
+            origin &&
+            origin !== FRONTEND_ORIGIN
         ) {
+            socket.write(
+                "HTTP/1.1 403 Forbidden\r\n\r\n"
+            );
+
+            socket.destroy();
+
             return;
         }
 
-        socket.send(
-            JSON.stringify({
-                type: "STATE",
+        const pathname =
+            new URL(
+                request.url,
+                `http://${request.headers.host}`
+            ).pathname;
 
-                active:
-                    state.activeDares,
-
-                activeDares:
-                    Object.values(
-                        state.activeDares
-                    ),
-
-                queues:
-                    state.queues,
-
-                streamers:
-                    streamers.rows.map(
-                        publicStreamer
-                    )
-            })
-        );
-
-    } catch (error) {
-
-        console.error(
-            "WebSocket state error:",
-            error
-        );
-    }
-}
-
-/* =========================================================
-   WEBSOCKET AUTH
-========================================================= */
-
-async function authenticateWebSocket(
-    socket,
-    token
-) {
-
-    if (
-        typeof token !==
-        "string" ||
-        !token.trim()
-    ) {
-
-        socket.send(
-            JSON.stringify({
-                type: "AUTH_ERROR",
-                error: {
-                    code:
-                        "AUTH_REQUIRED",
-                    message:
-                        "Authentication token is required."
-                }
-            })
-        );
-
-        return false;
-    }
-
-    try {
-
-        const user =
-            await getUserFromToken(
-                token.trim()
+        if (
+            pathname !== "/ws"
+        ) {
+            socket.write(
+                "HTTP/1.1 404 Not Found\r\n\r\n"
             );
 
-        if (!user) {
+            socket.destroy();
 
-            socket.send(
-                JSON.stringify({
-                    type: "AUTH_ERROR",
-                    error: {
-                        code:
-                            "INVALID_SESSION",
-                        message:
-                            "Your session is invalid or expired."
-                    }
-                })
-            );
-
-            return false;
+            return;
         }
 
-        const streamer =
-            await getStreamerForUser(
-                user.id
-            );
-
-        if (!streamer) {
-
-            socket.send(
-                JSON.stringify({
-                    type: "AUTH_ERROR",
-                    error: {
-                        code:
-                            "STREAMER_NOT_FOUND",
-                        message:
-                            "Your Nerve streamer profile was not found."
-                    }
-                })
-            );
-
-            return false;
-        }
-
-        socket.user = user;
-
-        socket.streamerId =
-            Number(
-                streamer.id
-            );
-
-        socket.authenticated =
-            true;
-
-        socket.connectionRole =
-            "controller";
-
-        await addControllerConnection(
-            socket.streamerId
+        wss.handleUpgrade(
+            request,
+            socket,
+            head,
+            (ws) => {
+                wss.emit(
+                    "connection",
+                    ws,
+                    request
+                );
+            }
         );
-
-        socket.send(
-            JSON.stringify({
-                type: "AUTH_SUCCESS",
-
-                user: {
-                    id:
-                        user.id,
-
-                    username:
-                        user.username,
-
-                    role:
-                        user.role
-                },
-
-                streamer:
-                    publicStreamer(
-                        {
-                            ...streamer,
-                            connected: true
-                        }
-                    )
-            })
-        );
-
-        await sendState(
-            socket
-        );
-
-        return true;
-
-    } catch (error) {
-
-        console.error(
-            "WebSocket authentication error:",
-            error
-        );
-
-        socket.send(
-            JSON.stringify({
-                type: "AUTH_ERROR",
-                error: {
-                    code:
-                        "AUTH_FAILED",
-                    message:
-                        "Could not authenticate the connection."
-                }
-            })
-        );
-
-        return false;
     }
-}
-
-/* =========================================================
-   WEBSOCKET CONNECTION
-========================================================= */
+);
 
 wss.on(
     "connection",
-    socket => {
-
-        console.log(
-            "WebSocket client connected."
-        );
-
+    (socket) => {
         socket.authenticated =
             false;
+
+        socket.connectionRole =
+            null;
 
         socket.user =
             null;
@@ -2898,114 +2785,376 @@ wss.on(
         socket.streamerId =
             null;
 
-        socket.connectionRole =
-            null;
+        socket.controllerRegistered =
+            false;
 
         /*
-         * We intentionally DO NOT send
-         * private controller state before
-         * authentication.
+         * Public pages are allowed to connect.
+         *
+         * They can request STATE but cannot
+         * control dares.
          */
 
-        socket.send(
-            JSON.stringify({
-                type:
-                    "CONNECTED",
-                message:
-                    "WebSocket connected. Authenticate to control your Nerve account."
-            })
-        );
+        try {
+            socket.send(
+                JSON.stringify({
+                    type:
+                        "CONNECTED"
+                })
+            );
+        } catch (_) {}
 
         socket.on(
             "message",
-            async rawMessage => {
+            async (raw) => {
+                let message;
 
                 try {
-
-                    const message =
+                    message =
                         JSON.parse(
-                            rawMessage.toString()
+                            raw.toString()
                         );
+                } catch (_) {
+                    try {
+                        socket.send(
+                            JSON.stringify({
+                                type:
+                                    "ERROR",
 
-                    /* =========================
-                       AUTH
-                    ========================= */
+                                error:
+                                    "Invalid JSON."
+                            })
+                        );
+                    } catch (_) {}
 
+                    return;
+                }
+
+                if (
+                    !message ||
+                    typeof message.type !==
+                        "string"
+                ) {
+                    return;
+                }
+
+                /*
+                 * ==========================================
+                 * AUTH
+                 * ==========================================
+                 */
+
+                if (
+                    message.type ===
+                    "AUTH"
+                ) {
                     if (
-                        message.type ===
-                        "AUTH"
+                        socket.authenticated
                     ) {
+                        return;
+                    }
 
-                        if (
-                            socket.authenticated
-                        ) {
+                    const token =
+                        typeof message.token ===
+                            "string"
+                            ? message.token.trim()
+                            : "";
+
+                    if (!token) {
+                        try {
+                            socket.send(
+                                JSON.stringify({
+                                    type:
+                                        "AUTH_ERROR",
+
+                                    error:
+                                        "Authentication token required."
+                                })
+                            );
+                        } catch (_) {}
+
+                        return;
+                    }
+
+                    try {
+                        const user =
+                            await getUserFromToken(
+                                token
+                            );
+
+                        if (!user) {
+                            try {
+                                socket.send(
+                                    JSON.stringify({
+                                        type:
+                                            "AUTH_FAILED",
+
+                                        error:
+                                            "Invalid or expired session."
+                                    })
+                                );
+                            } catch (_) {}
+
                             return;
                         }
 
-                        await authenticateWebSocket(
-                            socket,
-                            message.token
+                        const streamer =
+                            await getStreamerForUser(
+                                user.id
+                            );
+
+                        if (!streamer) {
+                            try {
+                                socket.send(
+                                    JSON.stringify({
+                                        type:
+                                            "AUTH_ERROR",
+
+                                        error:
+                                            "No streamer profile exists for this account."
+                                    })
+                                );
+                            } catch (_) {}
+
+                            return;
+                        }
+
+                        /*
+                         * Only controller role is supported
+                         * by the current frontend.
+                         */
+
+                        const role =
+                            message.role ||
+                            "controller";
+
+                        if (
+                            role !==
+                            "controller"
+                        ) {
+                            try {
+                                socket.send(
+                                    JSON.stringify({
+                                        type:
+                                            "AUTH_ERROR",
+
+                                        error:
+                                            "Unsupported WebSocket role."
+                                    })
+                                );
+                            } catch (_) {}
+
+                            return;
+                        }
+
+                        socket.authenticated =
+                            true;
+
+                        socket.connectionRole =
+                            "controller";
+
+                        socket.user =
+                            user;
+
+                        socket.streamerId =
+                            streamer.id;
+
+                        socket.controllerRegistered =
+                            true;
+
+                        await addControllerConnection(
+                            streamer.id
                         );
+
+                        try {
+                            socket.send(
+                                JSON.stringify({
+                                    type:
+                                        "AUTH_OK",
+
+                                    user:
+                                        publicUser(
+                                            user
+                                        ),
+
+                                    streamer:
+                                        publicStreamer(
+                                            streamer
+                                        )
+                                })
+                            );
+                        } catch (_) {}
+
+                        await sendState(
+                            socket
+                        );
+
+                        return;
+                    } catch (error) {
+                        console.error(
+                            "WebSocket AUTH error:",
+                            error
+                        );
+
+                        try {
+                            socket.send(
+                                JSON.stringify({
+                                    type:
+                                        "AUTH_ERROR",
+
+                                    error:
+                                        "Authentication service error."
+                                })
+                            );
+                        } catch (_) {}
+
+                        return;
+                    }
+                }
+
+                /*
+                 * ==========================================
+                 * GET STATE
+                 * ==========================================
+                 *
+                 * Public.
+                 *
+                 * Needed by:
+                 * - index.html
+                 * - overlay.html
+                 *
+                 * Controller can also use it after AUTH_OK.
+                 */
+
+                if (
+                    message.type ===
+                    "GET_STATE"
+                ) {
+                    await sendState(
+                        socket
+                    );
+
+                    return;
+                }
+
+                /*
+                 * ==========================================
+                 * GET ACTIVE DARES
+                 * ==========================================
+                 *
+                 * Public.
+                 *
+                 * index.html currently sends this
+                 * immediately after WebSocket connection.
+                 */
+
+                if (
+                    message.type ===
+                    "GET_ACTIVE_DARES"
+                ) {
+                    try {
+                        const state =
+                            await getAllDareState();
+
+                        socket.send(
+                            JSON.stringify({
+                                type:
+                                    "ACTIVE_DARE_STATE",
+
+                                activeDares:
+                                    state.activeDares
+                            })
+                        );
+                    } catch (error) {
+                        console.error(
+                            "GET_ACTIVE_DARES error:",
+                            error
+                        );
+                    }
+
+                    return;
+                }
+
+                /*
+                 * ==========================================
+                 * CONTROLLER-ONLY ACTIONS
+                 * ==========================================
+                 */
+
+                if (
+                    message.type ===
+                        "CONTROLLER_ACTION" ||
+                    message.type ===
+                        "UPDATE_DARE"
+                ) {
+                    if (
+                        !socket.authenticated
+                    ) {
+                        try {
+                            socket.send(
+                                JSON.stringify({
+                                    type:
+                                        "AUTH_REQUIRED",
+
+                                    error:
+                                        "Controller authentication required."
+                                })
+                            );
+                        } catch (_) {}
 
                         return;
                     }
 
                     /*
-                     * Everything below this point
-                     * requires authenticated controller
-                     * access.
+                     * The current controller frontend
+                     * performs dare mutations through
+                     * REST, so there is no direct WS
+                     * mutation endpoint here.
                      */
 
-                    if (
-                        !socket.authenticated
-                    ) {
-
+                    try {
                         socket.send(
                             JSON.stringify({
                                 type:
-                                    "AUTH_REQUIRED",
-                                error: {
-                                    code:
-                                        "AUTH_REQUIRED",
-                                    message:
-                                        "Authenticate this WebSocket connection first."
-                                }
+                                    "ERROR",
+
+                                error:
+                                    "Use the REST API for controller actions."
                             })
                         );
+                    } catch (_) {}
 
-                        return;
-                    }
+                    return;
+                }
 
-                    if (
-                        message.type ===
-                        "GET_STATE"
-                    ) {
+                /*
+                 * Unknown messages are harmless.
+                 */
 
-                        await sendState(
-                            socket
+                if (
+                    message.type !==
+                        "PING"
+                ) {
+                    try {
+                        socket.send(
+                            JSON.stringify({
+                                type:
+                                    "ERROR",
+
+                                error:
+                                    "Unknown WebSocket message."
+                            })
                         );
-
-                        return;
-                    }
-
-                    if (
-                        message.type ===
-                        "GET_ACTIVE_DARES"
-                    ) {
-
-                        await sendState(
-                            socket
+                    } catch (_) {}
+                } else {
+                    try {
+                        socket.send(
+                            JSON.stringify({
+                                type:
+                                    "PONG"
+                            })
                         );
-
-                        return;
-                    }
-
-                } catch (error) {
-
-                    console.error(
-                        "Invalid WebSocket message:",
-                        error
-                    );
+                    } catch (_) {}
                 }
             }
         );
@@ -3013,227 +3162,193 @@ wss.on(
         socket.on(
             "close",
             async () => {
-
-                console.log(
-                    "WebSocket client disconnected."
-                );
-
                 if (
-                    socket.authenticated &&
-                    socket.streamerId !== null
+                    socket.controllerRegistered &&
+                    socket.streamerId
                 ) {
+                    socket.controllerRegistered =
+                        false;
 
-                    try {
-
-                        await removeControllerConnection(
-                            socket.streamerId
-                        );
-
-                    } catch (error) {
-
-                        console.error(
-                            "Streamer disconnect error:",
-                            error
-                        );
-                    }
+                    await removeControllerConnection(
+                        socket.streamerId
+                    );
                 }
             }
         );
 
         socket.on(
             "error",
-            error => {
-
-                console.error(
+            (error) => {
+                console.warn(
                     "WebSocket error:",
-                    error
+                    error.message
                 );
             }
         );
     }
 );
 
-/* =========================================================
+/* ============================================================
    CREATE DARE
-   PUBLIC
-========================================================= */
+============================================================ */
 
 app.post(
     "/api/dare",
     async (req, res) => {
+        const body =
+            req.body || {};
+
+        /*
+         * Current submit.html sends:
+         *
+         * streamer
+         * streamer_source
+         * viewer
+         * dare_text
+         * duration
+         * reward
+         *
+         * It does not currently send streamerId,
+         * so support both ID and legacy username.
+         */
+
+        let streamer = null;
+
+        if (
+            body.streamerId !==
+                undefined &&
+            body.streamerId !==
+                null &&
+            body.streamerId !== ""
+        ) {
+            streamer =
+                await getStreamerById(
+                    body.streamerId
+                );
+        }
+
+        if (!streamer) {
+            streamer =
+                await getStreamerByUsername(
+                    body.streamer
+                );
+        }
+
+        if (!streamer) {
+            return sendError(
+                res,
+                404,
+                "Streamer not found.",
+                "STREAMER_NOT_FOUND"
+            );
+        }
+
+        /*
+         * Only currently connected streamers
+         * can receive public dares.
+         */
+
+        if (
+            !streamer.connected
+        ) {
+            return sendError(
+                res,
+                409,
+                "That streamer is currently offline.",
+                "STREAMER_OFFLINE"
+            );
+        }
+
+        const viewer =
+            cleanText(
+                body.viewer ||
+                    "Anonymous",
+                100
+            );
+
+        const dareText =
+            cleanText(
+                body.dare_text ??
+                    body.dareText ??
+                    body.text,
+                MAX_DARE_LENGTH
+            );
+
+        const duration =
+            parsePositiveInteger(
+                body.duration
+            );
+
+        const reward =
+            parseReward(
+                body.reward
+            );
+
+        if (!viewer) {
+            return sendError(
+                res,
+                400,
+                "Viewer name is required.",
+                "VIEWER_REQUIRED"
+            );
+        }
+
+        if (!dareText) {
+            return sendError(
+                res,
+                400,
+                "Dare text is required.",
+                "DARE_REQUIRED"
+            );
+        }
+
+        if (
+            !duration ||
+            duration <
+                MIN_DARE_DURATION ||
+            duration >
+                MAX_DARE_DURATION
+        ) {
+            return sendError(
+                res,
+                400,
+                `Time limit must be between ${MIN_DARE_DURATION} and ${MAX_DARE_DURATION} seconds.`,
+                "INVALID_DURATION"
+            );
+        }
+
+        if (
+            reward === null
+        ) {
+            return sendError(
+                res,
+                400,
+                `Reward must be between ₱0 and ₱${MAX_REWARD.toLocaleString()}.`,
+                "INVALID_REWARD"
+            );
+        }
 
         const client =
             await pool.connect();
 
         try {
-
-            /*
-             * NEW:
-             *
-             * streamerId is the authoritative
-             * target.
-             *
-             * Legacy streamer username remains
-             * temporarily supported.
-             */
-
-            let streamerId =
-                parsePositiveInteger(
-                    req.body.streamerId
-                );
-
-            let streamer =
-                cleanDisplayUsername(
-                    req.body.streamer
-                );
-
-            let viewer =
-                req.body.viewer;
-
-            let dareText =
-                req.body.dare_text ||
-                req.body.dareText ||
-                req.body.text;
-
-            const duration =
-                Number(
-                    req.body.duration
-                );
-
-            const reward =
-                parseReward(
-                    req.body.reward
-                );
-
-            let streamerRecord = null;
-
-            /*
-             * Preferred:
-             * streamerId
-             */
-
-            if (
-                streamerId !== null &&
-                streamerId !== 0
-            ) {
-
-                streamerRecord =
-                    await getStreamerById(
-                        streamerId
-                    );
-
-            /*
-             * Temporary legacy fallback.
-             */
-
-            } else if (
-                streamer
-            ) {
-
-                streamerRecord =
-                    await getStreamerByLegacyUsername(
-                        streamer
-                    );
-            }
-
-            if (!streamerRecord) {
-
-                return sendError(
-                    res,
-                    404,
-                    "STREAMER_NOT_FOUND",
-                    "That Nerve streamer is not currently connected."
-                );
-            }
-
-            streamerId =
-                Number(
-                    streamerRecord.id
-                );
-
-            if (
-                !streamerRecord.connected
-            ) {
-
-                return sendError(
-                    res,
-                    409,
-                    "STREAMER_OFFLINE",
-                    "That streamer is not currently connected."
-                );
-            }
-
-            viewer =
-                cleanText(
-                    viewer ||
-                    "Anonymous",
-                    255
-                );
-
-            if (!viewer) {
-                viewer =
-                    "Anonymous";
-            }
-
-            dareText =
-                cleanText(
-                    dareText,
-                    1000
-                );
-
-            if (!dareText) {
-
-                return sendError(
-                    res,
-                    400,
-                    "DARE_REQUIRED",
-                    "Dare text is required."
-                );
-            }
-
-            if (
-                !Number.isInteger(
-                    duration
-                ) ||
-                duration < 5 ||
-                duration > 300
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_DURATION",
-                    "Duration must be between 5 and 300 seconds."
-                );
-            }
-
-            if (
-                reward === null
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_REWARD",
-                    "Reward must be a valid non-negative number."
-                );
-            }
-
             await client.query(
                 "BEGIN"
             );
 
             /*
-             * Lock by permanent streamer ID.
+             * Serialize dare creation/status changes
+             * for this streamer.
              */
 
             await client.query(
                 `
-                SELECT
-                    pg_advisory_xact_lock($1::bigint)
+                SELECT pg_advisory_xact_lock($1)
                 `,
                 [
-                    streamerId
+                    Number(
+                        streamer.id
+                    )
                 ]
             );
 
@@ -3247,105 +3362,81 @@ app.post(
                         AND status = 'accepted'
                     LIMIT 1
                     `,
-                    [
-                        streamerId
-                    ]
+                    [streamer.id]
                 );
 
             const status =
-                activeResult.rows.length
-                    ? "pending"
-                    : "accepted";
-
-            const acceptedAt =
-                status === "accepted"
-                    ? new Date()
-                    : null;
+                activeResult.rows
+                    .length === 0
+                    ? "accepted"
+                    : "pending";
 
             const inserted =
                 await client.query(
                     `
                     INSERT INTO dares (
-                        streamer_id,
                         streamer,
                         streamer_source,
+                        streamer_id,
                         viewer,
                         dare_text,
                         duration,
                         reward,
                         status,
-                        accepted_at,
-                        updated_at
+                        accepted_at
                     )
                     VALUES (
                         $1,
-                        $2,
                         'nerve_account',
+                        $2,
                         $3,
                         $4,
                         $5,
                         $6,
                         $7,
-                        $8,
-                        NOW()
+                        CASE
+                            WHEN $7 = 'accepted'
+                            THEN NOW()
+                            ELSE NULL
+                        END
                     )
-                    RETURNING
-                        *
+                    RETURNING *
                     `,
                     [
-                        streamerId,
-
-                        streamerRecord.username,
-
+                        streamer.username,
+                        streamer.id,
                         viewer,
-
                         dareText,
-
                         duration,
-
                         reward,
-
-                        status,
-
-                        acceptedAt
-                    ]
-                );
-
-            const rawDare =
-                inserted.rows[0];
-
-            /*
-             * Fetch the streamer metadata
-             * for the response.
-             */
-
-            const formattedResult =
-                await client.query(
-                    `
-                    SELECT
-                        d.*,
-                        s.display_name
-                            AS streamer_display_name,
-                        s.platform,
-                        s.platform_username
-                    FROM dares d
-                    LEFT JOIN streamers s
-                        ON s.id = d.streamer_id
-                    WHERE d.id = $1
-                    `,
-                    [
-                        rawDare.id
+                        status
                     ]
                 );
 
             const dare =
-                formatDare(
-                    formattedResult.rows[0]
-                );
+                formatDare({
+                    ...inserted.rows[0],
+
+                    streamer_username:
+                        streamer.username,
+
+                    streamer_display_name:
+                        streamer.display_name,
+
+                    platform:
+                        streamer.platform,
+
+                    platform_username:
+                        streamer.platform_username
+                });
 
             await client.query(
                 "COMMIT"
             );
+
+            /*
+             * Notify every connected frontend.
+             */
 
             broadcast({
                 type:
@@ -3355,20 +3446,14 @@ app.post(
             });
 
             if (
-                status === "accepted"
+                status ===
+                "accepted"
             ) {
-
                 broadcast({
                     type:
                         "ACTIVE_DARE",
 
-                    dare,
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer
+                    dare
                 });
             }
 
@@ -3377,37 +3462,58 @@ app.post(
                     `
                     SELECT
                         d.*,
+
+                        s.username
+                            AS streamer_username,
+
                         s.display_name
                             AS streamer_display_name,
+
                         s.platform,
+
                         s.platform_username
+
                     FROM dares d
+
                     LEFT JOIN streamers s
-                        ON s.id = d.streamer_id
+                        ON s.id =
+                            d.streamer_id
+
                     WHERE
                         d.streamer_id = $1
                         AND d.status = 'pending'
+
                     ORDER BY
-                        d.created_at ASC
+                        d.created_at ASC,
+                        d.id ASC
                     `,
-                    [
-                        streamerId
-                    ]
+                    [streamer.id]
                 );
 
             const queue =
                 queueResult.rows.map(
-                    formatDare
+                    (row) =>
+                        formatDare({
+                            ...row,
+
+                            streamer:
+                                row.streamer_username ||
+                                row.streamer,
+
+                            streamer_display_name:
+                                row.streamer_display_name
+                        })
                 );
 
             broadcast({
                 type:
                     "QUEUE_UPDATED",
 
-                streamerId,
+                streamerId:
+                    streamer.id,
 
-                streamer:
-                    dare.streamer,
+                streamer_id:
+                    streamer.id,
 
                 queue
             });
@@ -3417,18 +3523,32 @@ app.post(
 
                 dare,
 
+                /*
+                 * Current submit.html checks
+                 * this exact property.
+                 */
+
+                activeDare:
+                    status ===
+                    "accepted"
+                        ? dare
+                        : null,
+
                 queuePosition:
-                    status === "pending"
+                    status ===
+                    "pending"
                         ? queue.findIndex(
-                            item =>
-                                item.id ===
-                                dare.id
+                            (item) =>
+                                String(
+                                    item.id
+                                ) ===
+                                String(
+                                    dare.id
+                                )
                         ) + 1
                         : 0
             });
-
         } catch (error) {
-
             try {
                 await client.query(
                     "ROLLBACK"
@@ -3443,102 +3563,78 @@ app.post(
             return sendError(
                 res,
                 500,
-                "DARE_CREATE_FAILED",
-                "Could not create the dare."
+                "Unable to submit the dare."
             );
-
         } finally {
-
             client.release();
         }
     }
 );
 
-/* =========================================================
-   GET CURRENT DARE STATE
-========================================================= */
+/* ============================================================
+   GET ALL DARES
+============================================================ */
 
 app.get(
     "/api/dare",
     async (req, res) => {
-
         try {
-
             const state =
                 await getAllDareState();
 
             return res.json({
+                success: true,
+
+                active:
+                    state.active,
+
                 activeDares:
-                    Object.values(
-                        state.activeDares
-                    ),
+                    state.activeDares,
 
                 queues:
                     state.queues,
 
-                streamers:
-                    []
+                data: state
             });
-
         } catch (error) {
-
             console.error(
-                "Dare state error:",
+                "Get dare state error:",
                 error
             );
 
             return sendError(
                 res,
                 500,
-                "STATE_FAILED",
-                "Could not load dare state."
+                "Unable to load dare state."
             );
         }
     }
 );
 
-/* =========================================================
-   GET STREAMER QUEUE
-   SUPPORTS STREAMER ID
-========================================================= */
+/* ============================================================
+   GET QUEUE
+============================================================ */
 
 app.get(
     "/api/dare/queue/:streamer",
     async (req, res) => {
-
         try {
-
-            const identifier =
+            const value =
                 req.params.streamer;
 
-            let streamerRecord =
-                null;
-
-            if (
-                /^\d+$/.test(
-                    identifier
-                )
-            ) {
-
-                streamerRecord =
-                    await getStreamerById(
-                        identifier
+            const streamer =
+                /^\d+$/.test(value)
+                    ? await getStreamerById(
+                        value
+                    )
+                    : await getStreamerByUsername(
+                        value
                     );
 
-            } else {
-
-                streamerRecord =
-                    await getStreamerByLegacyUsername(
-                        identifier
-                    );
-            }
-
-            if (!streamerRecord) {
-
+            if (!streamer) {
                 return sendError(
                     res,
                     404,
-                    "STREAMER_NOT_FOUND",
                     "Streamer not found."
                 );
             }
@@ -3548,41 +3644,60 @@ app.get(
                     `
                     SELECT
                         d.*,
+
+                        s.username
+                            AS streamer_username,
+
                         s.display_name
                             AS streamer_display_name,
+
                         s.platform,
+
                         s.platform_username
+
                     FROM dares d
+
                     LEFT JOIN streamers s
-                        ON s.id = d.streamer_id
+                        ON s.id =
+                            d.streamer_id
+
                     WHERE
                         d.streamer_id = $1
                         AND d.status = 'pending'
+
                     ORDER BY
-                        d.created_at ASC
+                        d.created_at ASC,
+                        d.id ASC
                     `,
-                    [
-                        streamerRecord.id
-                    ]
+                    [streamer.id]
+                );
+
+            const queue =
+                result.rows.map(
+                    (row) =>
+                        formatDare({
+                            ...row,
+
+                            streamer:
+                                row.streamer_username ||
+                                row.streamer,
+
+                            streamer_display_name:
+                                row.streamer_display_name
+                        })
                 );
 
             return res.json({
-                streamerId:
-                    Number(
-                        streamerRecord.id
-                    ),
+                success: true,
 
                 streamer:
-                    streamerRecord.username,
+                    publicStreamer(
+                        streamer
+                    ),
 
-                queue:
-                    result.rows.map(
-                        formatDare
-                    )
+                queue
             });
-
         } catch (error) {
-
             console.error(
                 "Queue error:",
                 error
@@ -3591,53 +3706,38 @@ app.get(
             return sendError(
                 res,
                 500,
-                "QUEUE_FAILED",
-                "Could not load the queue."
+                "Unable to load dare queue."
             );
         }
     }
 );
 
-/* =========================================================
+/* ============================================================
    GET ACTIVE DARE
-========================================================= */
+============================================================ */
 
 app.get(
     "/api/dare/active/:streamer",
     async (req, res) => {
-
         try {
-
-            const identifier =
+            const value =
                 req.params.streamer;
 
-            let streamerRecord =
-                null;
-
-            if (
-                /^\d+$/.test(
-                    identifier
-                )
-            ) {
-
-                streamerRecord =
-                    await getStreamerById(
-                        identifier
+            const streamer =
+                /^\d+$/.test(value)
+                    ? await getStreamerById(
+                        value
+                    )
+                    : await getStreamerByUsername(
+                        value
                     );
 
-            } else {
-
-                streamerRecord =
-                    await getStreamerByLegacyUsername(
-                        identifier
-                    );
-            }
-
-            if (!streamerRecord) {
-
-                return res.json({
-                    activeDare: null
-                });
+            if (!streamer) {
+                return sendError(
+                    res,
+                    404,
+                    "Streamer not found."
+                );
             }
 
             const result =
@@ -3645,36 +3745,60 @@ app.get(
                     `
                     SELECT
                         d.*,
+
+                        s.username
+                            AS streamer_username,
+
                         s.display_name
                             AS streamer_display_name,
+
                         s.platform,
+
                         s.platform_username
+
                     FROM dares d
+
                     LEFT JOIN streamers s
-                        ON s.id = d.streamer_id
+                        ON s.id =
+                            d.streamer_id
+
                     WHERE
                         d.streamer_id = $1
                         AND d.status = 'accepted'
+
                     ORDER BY
-                        d.accepted_at DESC NULLS LAST
+                        d.accepted_at ASC NULLS LAST,
+                        d.id ASC
+
                     LIMIT 1
                     `,
-                    [
-                        streamerRecord.id
-                    ]
+                    [streamer.id]
                 );
 
-            return res.json({
-                activeDare:
-                    result.rows.length
-                        ? formatDare(
+            const dare =
+                result.rows.length
+                    ? formatDare({
+                        ...result.rows[0],
+
+                        streamer:
                             result.rows[0]
-                        )
-                        : null
+                                .streamer_username ||
+                            result.rows[0]
+                                .streamer,
+
+                        streamer_display_name:
+                            result.rows[0]
+                                .streamer_display_name
+                    })
+                    : null;
+
+            return res.json({
+                success: true,
+
+                activeDare:
+                    dare
             });
-
         } catch (error) {
-
             console.error(
                 "Active dare error:",
                 error
@@ -3683,75 +3807,293 @@ app.get(
             return sendError(
                 res,
                 500,
-                "ACTIVE_FAILED",
-                "Could not load the active dare."
+                "Unable to load active dare."
             );
         }
     }
 );
 
-/* =========================================================
-   UPDATE DARE STATUS
-========================================================= */
+/* ============================================================
+   ACTIVATE NEXT DARE
+============================================================ */
+
+async function activateNextDare(
+    streamerId
+) {
+    const client =
+        await pool.connect();
+
+    try {
+        await client.query(
+            "BEGIN"
+        );
+
+        await client.query(
+            `
+            SELECT pg_advisory_xact_lock($1)
+            `,
+            [
+                Number(
+                    streamerId
+                )
+            ]
+        );
+
+        const active =
+            await client.query(
+                `
+                SELECT id
+                FROM dares
+                WHERE
+                    streamer_id = $1
+                    AND status = 'accepted'
+                LIMIT 1
+                `,
+                [streamerId]
+            );
+
+        if (
+            active.rows.length
+        ) {
+            await client.query(
+                "COMMIT"
+            );
+
+            return null;
+        }
+
+        const next =
+            await client.query(
+                `
+                SELECT
+                    d.*,
+
+                    s.username
+                        AS streamer_username,
+
+                    s.display_name
+                        AS streamer_display_name,
+
+                    s.platform,
+
+                    s.platform_username
+
+                FROM dares d
+
+                LEFT JOIN streamers s
+                    ON s.id =
+                        d.streamer_id
+
+                WHERE
+                    d.streamer_id = $1
+                    AND d.status = 'pending'
+
+                ORDER BY
+                    d.created_at ASC,
+                    d.id ASC
+
+                LIMIT 1
+
+                FOR UPDATE OF d SKIP LOCKED
+                `,
+                [streamerId]
+            );
+
+        if (
+            next.rows.length === 0
+        ) {
+            await client.query(
+                "COMMIT"
+            );
+
+            return null;
+        }
+
+        const row =
+            next.rows[0];
+
+        const updated =
+            await client.query(
+                `
+                UPDATE dares
+                SET
+                    status = 'accepted',
+                    accepted_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                `,
+                [row.id]
+            );
+
+        const dare =
+            formatDare({
+                ...updated.rows[0],
+
+                streamer:
+                    row.streamer_username ||
+                    row.streamer,
+
+                streamer_display_name:
+                    row.streamer_display_name,
+
+                platform:
+                    row.platform,
+
+                platform_username:
+                    row.platform_username
+            });
+
+        await client.query(
+            "COMMIT"
+        );
+
+        broadcast({
+            type:
+                "ACTIVE_DARE",
+
+            dare
+        });
+
+        const queueResult =
+            await pool.query(
+                `
+                SELECT
+                    d.*,
+
+                    s.username
+                        AS streamer_username,
+
+                    s.display_name
+                        AS streamer_display_name,
+
+                    s.platform,
+
+                    s.platform_username
+
+                FROM dares d
+
+                LEFT JOIN streamers s
+                    ON s.id =
+                        d.streamer_id
+
+                WHERE
+                    d.streamer_id = $1
+                    AND d.status = 'pending'
+
+                ORDER BY
+                    d.created_at ASC,
+                    d.id ASC
+                `,
+                [streamerId]
+            );
+
+        const queue =
+            queueResult.rows.map(
+                (queueRow) =>
+                    formatDare({
+                        ...queueRow,
+
+                        streamer:
+                            queueRow.streamer_username ||
+                            queueRow.streamer,
+
+                        streamer_display_name:
+                            queueRow.streamer_display_name
+                    })
+            );
+
+        broadcast({
+            type:
+                "QUEUE_UPDATED",
+
+            streamerId:
+                streamerId,
+
+            streamer_id:
+                streamerId,
+
+            queue
+        });
+
+        return dare;
+    } catch (error) {
+        try {
+            await client.query(
+                "ROLLBACK"
+            );
+        } catch (_) {}
+
+        console.error(
+            "Activate next dare error:",
+            error
+        );
+
+        return null;
+    } finally {
+        client.release();
+    }
+}
+
+/* ============================================================
+   DARE STATUS
+============================================================ */
 
 app.post(
     "/api/dare/:id/status",
-    authenticateRequest,
     requireAuth,
     async (req, res) => {
+        const dareId =
+            Number(
+                req.params.id
+            );
+
+        const status =
+            String(
+                req.body?.status ||
+                    ""
+            )
+                .trim()
+                .toLowerCase();
+
+        const validStatuses = [
+            "accepted",
+            "rejected",
+            "completed",
+            "failed"
+        ];
+
+        if (
+            !Number.isInteger(
+                dareId
+            ) ||
+            dareId < 1
+        ) {
+            return sendError(
+                res,
+                400,
+                "Invalid dare ID.",
+                "INVALID_DARE_ID"
+            );
+        }
+
+        if (
+            !validStatuses.includes(
+                status
+            )
+        ) {
+            return sendError(
+                res,
+                400,
+                "Invalid dare status.",
+                "INVALID_STATUS"
+            );
+        }
 
         const client =
             await pool.connect();
 
         try {
-
-            const id =
-                parsePositiveInteger(
-                    req.params.id
-                );
-
-            const status =
-                String(
-                    req.body.status ||
-                    ""
-                )
-                .trim()
-                .toLowerCase();
-
-            const allowedStatuses = [
-                "accepted",
-                "rejected",
-                "completed",
-                "failed"
-            ];
-
-            if (
-                id === null ||
-                id === 0
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_ID",
-                    "Invalid dare ID."
-                );
-            }
-
-            if (
-                !allowedStatuses.includes(
-                    status
-                )
-            ) {
-
-                return sendError(
-                    res,
-                    400,
-                    "INVALID_STATUS",
-                    "Invalid dare status."
-                );
-            }
-
             await client.query(
                 "BEGIN"
             );
@@ -3760,18 +4102,36 @@ app.post(
                 await client.query(
                     `
                     SELECT
-                        *
-                    FROM dares
-                    WHERE id = $1
-                    FOR UPDATE
+                        d.*,
+
+                        s.owner_user_id,
+                        s.username
+                            AS streamer_username,
+
+                        s.display_name
+                            AS streamer_display_name,
+
+                        s.platform,
+
+                        s.platform_username
+
+                    FROM dares d
+
+                    JOIN streamers s
+                        ON s.id =
+                            d.streamer_id
+
+                    WHERE d.id = $1
+
+                    FOR UPDATE OF d
                     `,
-                    [id]
+                    [dareId]
                 );
 
             if (
-                dareResult.rows.length === 0
+                dareResult.rows.length ===
+                0
             ) {
-
                 await client.query(
                     "ROLLBACK"
                 );
@@ -3779,40 +4139,30 @@ app.post(
                 return sendError(
                     res,
                     404,
-                    "DARE_NOT_FOUND",
-                    "Dare not found."
+                    "Dare not found.",
+                    "DARE_NOT_FOUND"
                 );
             }
 
-            const current =
+            const row =
                 dareResult.rows[0];
 
-            /*
-             * Ownership is now based on
-             * streamer_id.
-             */
-
-            const ownershipResult =
-                await client.query(
-                    `
-                    SELECT id
-                    FROM streamers
-                    WHERE
-                        id = $1
-                        AND owner_user_id = $2
-                    LIMIT 1
-                    `,
-                    [
-                        current.streamer_id,
-                        req.user.id
-                    ]
+            const isOwner =
+                Number(
+                    row.owner_user_id
+                ) ===
+                Number(
+                    req.user.id
                 );
 
-            if (
-                ownershipResult.rows.length === 0 &&
-                req.user.role !== "admin"
-            ) {
+            const isAdmin =
+                req.user.role ===
+                "admin";
 
+            if (
+                !isOwner &&
+                !isAdmin
+            ) {
                 await client.query(
                     "ROLLBACK"
                 );
@@ -3820,35 +4170,34 @@ app.post(
                 return sendError(
                     res,
                     403,
-                    "STREAMER_NOT_OWNED",
-                    "You do not control this streamer."
+                    "You do not control this streamer.",
+                    "FORBIDDEN"
                 );
             }
 
-            /*
-             * Lock this streamer's queue
-             * while changing its active dare.
-             */
-
             await client.query(
                 `
-                SELECT
-                    pg_advisory_xact_lock($1::bigint)
+                SELECT pg_advisory_xact_lock($1)
                 `,
                 [
-                    current.streamer_id
+                    Number(
+                        row.streamer_id
+                    )
                 ]
             );
 
-            if (
-                status === "accepted"
-            ) {
+            /*
+             * ACCEPT
+             */
 
+            if (
+                status ===
+                "accepted"
+            ) {
                 if (
-                    current.status !==
+                    row.status !==
                     "pending"
                 ) {
-
                     await client.query(
                         "ROLLBACK"
                     );
@@ -3856,8 +4205,8 @@ app.post(
                     return sendError(
                         res,
                         409,
-                        "INVALID_TRANSITION",
-                        "Only pending dares can be accepted."
+                        "Only pending dares can be accepted.",
+                        "INVALID_TRANSITION"
                     );
                 }
 
@@ -3869,19 +4218,16 @@ app.post(
                         WHERE
                             streamer_id = $1
                             AND status = 'accepted'
-                            AND id <> $2
                         LIMIT 1
                         `,
                         [
-                            current.streamer_id,
-                            id
+                            row.streamer_id
                         ]
                     );
 
                 if (
                     active.rows.length
                 ) {
-
                     await client.query(
                         "ROLLBACK"
                     );
@@ -3889,8 +4235,8 @@ app.post(
                     return sendError(
                         res,
                         409,
-                        "ACTIVE_DARE_EXISTS",
-                        "Another dare is already active for this streamer."
+                        "This streamer already has an active dare.",
+                        "ACTIVE_DARE_EXISTS"
                     );
                 }
 
@@ -3905,31 +4251,25 @@ app.post(
                         WHERE id = $1
                         RETURNING *
                         `,
-                        [id]
-                    );
-
-                const metadata =
-                    await client.query(
-                        `
-                        SELECT
-                            d.*,
-                            s.display_name
-                                AS streamer_display_name,
-                            s.platform,
-                            s.platform_username
-                        FROM dares d
-                        LEFT JOIN streamers s
-                            ON s.id = d.streamer_id
-                        WHERE d.id = $1
-                        `,
-                        [id]
+                        [dareId]
                     );
 
                 const dare =
-                    formatDare(
-                        metadata.rows[0] ||
-                        updated.rows[0]
-                    );
+                    formatDare({
+                        ...updated.rows[0],
+
+                        streamer:
+                            row.streamer_username,
+
+                        streamer_display_name:
+                            row.streamer_display_name,
+
+                        platform:
+                            row.platform,
+
+                        platform_username:
+                            row.platform_username
+                    });
 
                 await client.query(
                     "COMMIT"
@@ -3939,69 +4279,32 @@ app.post(
                     type:
                         "ACTIVE_DARE",
 
-                    dare,
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer
+                    dare
                 });
 
-                const queueResult =
-                    await pool.query(
-                        `
-                        SELECT
-                            d.*,
-                            s.display_name
-                                AS streamer_display_name,
-                            s.platform,
-                            s.platform_username
-                        FROM dares d
-                        LEFT JOIN streamers s
-                            ON s.id = d.streamer_id
-                        WHERE
-                            d.streamer_id = $1
-                            AND d.status = 'pending'
-                        ORDER BY
-                            d.created_at ASC
-                        `,
-                        [
-                            dare.streamerId
-                        ]
-                    );
-
-                broadcast({
-                    type:
-                        "QUEUE_UPDATED",
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer,
-
-                    queue:
-                        queueResult.rows.map(
-                            formatDare
-                        )
-                });
+                await broadcastQueue(
+                    row.streamer_id
+                );
 
                 return res.json({
                     success: true,
+
                     dare
                 });
             }
 
-            if (
-                status === "rejected"
-            ) {
+            /*
+             * REJECT
+             */
 
+            if (
+                status ===
+                "rejected"
+            ) {
                 if (
-                    current.status !==
+                    row.status !==
                     "pending"
                 ) {
-
                     await client.query(
                         "ROLLBACK"
                     );
@@ -4009,8 +4312,8 @@ app.post(
                     return sendError(
                         res,
                         409,
-                        "INVALID_TRANSITION",
-                        "Only pending dares can be rejected."
+                        "Only pending dares can be rejected.",
+                        "INVALID_TRANSITION"
                     );
                 }
 
@@ -4024,31 +4327,25 @@ app.post(
                         WHERE id = $1
                         RETURNING *
                         `,
-                        [id]
-                    );
-
-                const metadata =
-                    await client.query(
-                        `
-                        SELECT
-                            d.*,
-                            s.display_name
-                                AS streamer_display_name,
-                            s.platform,
-                            s.platform_username
-                        FROM dares d
-                        LEFT JOIN streamers s
-                            ON s.id = d.streamer_id
-                        WHERE d.id = $1
-                        `,
-                        [id]
+                        [dareId]
                     );
 
                 const dare =
-                    formatDare(
-                        metadata.rows[0] ||
-                        updated.rows[0]
-                    );
+                    formatDare({
+                        ...updated.rows[0],
+
+                        streamer:
+                            row.streamer_username,
+
+                        streamer_display_name:
+                            row.streamer_display_name,
+
+                        platform:
+                            row.platform,
+
+                        platform_username:
+                            row.platform_username
+                    });
 
                 await client.query(
                     "COMMIT"
@@ -4058,70 +4355,34 @@ app.post(
                     type:
                         "DARE_REJECTED",
 
-                    dare,
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer
+                    dare
                 });
 
-                const queueResult =
-                    await pool.query(
-                        `
-                        SELECT
-                            d.*,
-                            s.display_name
-                                AS streamer_display_name,
-                            s.platform,
-                            s.platform_username
-                        FROM dares d
-                        LEFT JOIN streamers s
-                            ON s.id = d.streamer_id
-                        WHERE
-                            d.streamer_id = $1
-                            AND d.status = 'pending'
-                        ORDER BY
-                            d.created_at ASC
-                        `,
-                        [
-                            dare.streamerId
-                        ]
-                    );
-
-                broadcast({
-                    type:
-                        "QUEUE_UPDATED",
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer,
-
-                    queue:
-                        queueResult.rows.map(
-                            formatDare
-                        )
-                });
+                await broadcastQueue(
+                    row.streamer_id
+                );
 
                 return res.json({
                     success: true,
+
                     dare
                 });
             }
 
-            if (
-                status === "completed" ||
-                status === "failed"
-            ) {
+            /*
+             * COMPLETE / FAIL
+             */
 
+            if (
+                status ===
+                    "completed" ||
+                status ===
+                    "failed"
+            ) {
                 if (
-                    current.status !==
+                    row.status !==
                     "accepted"
                 ) {
-
                     await client.query(
                         "ROLLBACK"
                     );
@@ -4129,8 +4390,8 @@ app.post(
                     return sendError(
                         res,
                         409,
-                        "INVALID_TRANSITION",
-                        "Only active dares can be completed or failed."
+                        "Only active dares can be completed or failed.",
+                        "INVALID_TRANSITION"
                     );
                 }
 
@@ -4146,32 +4407,26 @@ app.post(
                         `,
                         [
                             status,
-                            id
+                            dareId
                         ]
                     );
 
-                const metadata =
-                    await client.query(
-                        `
-                        SELECT
-                            d.*,
-                            s.display_name
-                                AS streamer_display_name,
-                            s.platform,
-                            s.platform_username
-                        FROM dares d
-                        LEFT JOIN streamers s
-                            ON s.id = d.streamer_id
-                        WHERE d.id = $1
-                        `,
-                        [id]
-                    );
-
                 const dare =
-                    formatDare(
-                        metadata.rows[0] ||
-                        updated.rows[0]
-                    );
+                    formatDare({
+                        ...updated.rows[0],
+
+                        streamer:
+                            row.streamer_username,
+
+                        streamer_display_name:
+                            row.streamer_display_name,
+
+                        platform:
+                            row.platform,
+
+                        platform_username:
+                            row.platform_username
+                    });
 
                 await client.query(
                     "COMMIT"
@@ -4179,17 +4434,12 @@ app.post(
 
                 broadcast({
                     type:
-                        status === "completed"
+                        status ===
+                        "completed"
                             ? "DARE_COMPLETED"
                             : "DARE_FAILED",
 
-                    dare,
-
-                    streamerId:
-                        dare.streamerId,
-
-                    streamer:
-                        dare.streamer
+                    dare
                 });
 
                 broadcast({
@@ -4197,26 +4447,43 @@ app.post(
                         "ACTIVE_DARE_CLEARED",
 
                     streamerId:
-                        dare.streamerId,
+                        row.streamer_id,
+
+                    streamer_id:
+                        row.streamer_id,
 
                     streamer:
-                        dare.streamer,
+                        row.streamer_username,
 
                     dare
                 });
 
+                /*
+                 * Automatically promote the next
+                 * waiting dare.
+                 */
+
                 await activateNextDare(
-                    dare.streamerId
+                    row.streamer_id
                 );
 
                 return res.json({
                     success: true,
+
                     dare
                 });
             }
 
-        } catch (error) {
+            await client.query(
+                "ROLLBACK"
+            );
 
+            return sendError(
+                res,
+                400,
+                "Unsupported status."
+            );
+        } catch (error) {
             try {
                 await client.query(
                     "ROLLBACK"
@@ -4224,293 +4491,180 @@ app.post(
             } catch (_) {}
 
             console.error(
-                "Status update error:",
+                "Dare status error:",
                 error
             );
+
+            /*
+             * Unique active-dare constraint.
+             */
+
+            if (
+                error.code ===
+                "23505"
+            ) {
+                return sendError(
+                    res,
+                    409,
+                    "This streamer already has an active dare.",
+                    "ACTIVE_DARE_EXISTS"
+                );
+            }
 
             return sendError(
                 res,
                 500,
-                "STATUS_UPDATE_FAILED",
-                "Could not update the dare."
+                "Unable to update dare status."
             );
-
         } finally {
-
             client.release();
         }
     }
 );
 
-/* =========================================================
-   ACTIVATE NEXT DARE
-========================================================= */
+/* ============================================================
+   BROADCAST QUEUE
+============================================================ */
 
-async function activateNextDare(
+async function broadcastQueue(
     streamerId
 ) {
-
-    const client =
-        await pool.connect();
-
     try {
-
-        await client.query(
-            "BEGIN"
-        );
-
-        await client.query(
-            `
-            SELECT
-                pg_advisory_xact_lock($1::bigint)
-            `,
-            [
-                streamerId
-            ]
-        );
-
-        const active =
-            await client.query(
-                `
-                SELECT id
-                FROM dares
-                WHERE
-                    streamer_id = $1
-                    AND status = 'accepted'
-                LIMIT 1
-                `,
-                [
-                    streamerId
-                ]
-            );
-
-        if (
-            active.rows.length
-        ) {
-
-            await client.query(
-                "COMMIT"
-            );
-
-            return null;
-        }
-
-        const next =
-            await client.query(
-                `
-                SELECT *
-                FROM dares
-                WHERE
-                    streamer_id = $1
-                    AND status = 'pending'
-                ORDER BY
-                    created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-                `,
-                [
-                    streamerId
-                ]
-            );
-
-        if (
-            next.rows.length === 0
-        ) {
-
-            await client.query(
-                "COMMIT"
-            );
-
-            return null;
-        }
-
-        const updated =
-            await client.query(
-                `
-                UPDATE dares
-                SET
-                    status = 'accepted',
-                    accepted_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                `,
-                [
-                    next.rows[0].id
-                ]
-            );
-
-        const metadata =
-            await client.query(
-                `
-                SELECT
-                    d.*,
-                    s.display_name
-                        AS streamer_display_name,
-                    s.platform,
-                    s.platform_username
-                FROM dares d
-                LEFT JOIN streamers s
-                    ON s.id = d.streamer_id
-                WHERE d.id = $1
-                `,
-                [
-                    updated.rows[0].id
-                ]
-            );
-
-        const dare =
-            formatDare(
-                metadata.rows[0] ||
-                updated.rows[0]
-            );
-
-        await client.query(
-            "COMMIT"
-        );
-
-        broadcast({
-            type:
-                "ACTIVE_DARE",
-
-            dare,
-
-            streamerId:
-                dare.streamerId,
-
-            streamer:
-                dare.streamer
-        });
-
-        const queue =
+        const result =
             await pool.query(
                 `
                 SELECT
                     d.*,
+
+                    s.username
+                        AS streamer_username,
+
                     s.display_name
                         AS streamer_display_name,
+
                     s.platform,
+
                     s.platform_username
+
                 FROM dares d
+
                 LEFT JOIN streamers s
-                    ON s.id = d.streamer_id
+                    ON s.id =
+                        d.streamer_id
+
                 WHERE
                     d.streamer_id = $1
                     AND d.status = 'pending'
+
                 ORDER BY
-                    d.created_at ASC
+                    d.created_at ASC,
+                    d.id ASC
                 `,
-                [
-                    streamerId
-                ]
+                [streamerId]
+            );
+
+        const queue =
+            result.rows.map(
+                (row) =>
+                    formatDare({
+                        ...row,
+
+                        streamer:
+                            row.streamer_username ||
+                            row.streamer,
+
+                        streamer_display_name:
+                            row.streamer_display_name
+                    })
             );
 
         broadcast({
             type:
                 "QUEUE_UPDATED",
 
-            streamerId:
-                Number(streamerId),
+            streamerId,
 
-            streamer:
-                dare.streamer,
+            streamer_id:
+                streamerId,
 
-            queue:
-                queue.rows.map(
-                    formatDare
-                )
+            queue
         });
-
-        return dare;
-
     } catch (error) {
-
-        try {
-            await client.query(
-                "ROLLBACK"
-            );
-        } catch (_) {}
-
         console.error(
-            "Activate next dare error:",
+            "Broadcast queue error:",
             error
         );
-
-        return null;
-
-    } finally {
-
-        client.release();
     }
 }
 
-/* =========================================================
+/* ============================================================
    DARE HISTORY
-========================================================= */
+============================================================ */
 
 app.get(
     "/api/dare/history",
-    authenticateRequest,
     requireAuth,
     async (req, res) => {
-
         try {
-
-            let limit =
-                Number(
-                    req.query.limit || 100
-                );
-
-            if (
-                !Number.isInteger(limit) ||
-                limit < 1
-            ) {
-                limit = 100;
-            }
-
-            limit =
-                Math.min(
-                    limit,
-                    500
-                );
-
             const result =
                 await pool.query(
                     `
                     SELECT
                         d.*,
+
+                        s.username
+                            AS streamer_username,
+
                         s.display_name
                             AS streamer_display_name,
+
                         s.platform,
+
                         s.platform_username
+
                     FROM dares d
 
-                    INNER JOIN streamers s
-                        ON s.id = d.streamer_id
+                    JOIN streamers s
+                        ON s.id =
+                            d.streamer_id
 
                     WHERE
                         s.owner_user_id = $1
 
                     ORDER BY
-                        d.created_at DESC
+                        d.created_at DESC,
+                        d.id DESC
 
-                    LIMIT $2
+                    LIMIT 500
                     `,
-                    [
-                        req.user.id,
-                        limit
-                    ]
+                    [req.user.id]
+                );
+
+            const dares =
+                result.rows.map(
+                    (row) =>
+                        formatDare({
+                            ...row,
+
+                            streamer:
+                                row.streamer_username ||
+                                row.streamer,
+
+                            streamer_display_name:
+                                row.streamer_display_name
+                        })
                 );
 
             return res.json({
-                history:
-                    result.rows.map(
-                        formatDare
-                    )
+                success: true,
+
+                data: {
+                    dares
+                },
+
+                dares
             });
-
         } catch (error) {
-
             console.error(
                 "History error:",
                 error
@@ -4519,46 +4673,38 @@ app.get(
             return sendError(
                 res,
                 500,
-                "HISTORY_FAILED",
-                "Could not load dare history."
+                "Unable to load dare history."
             );
         }
     }
 );
 
-/* =========================================================
-   CLEAR DARES
-   ADMIN ONLY
-========================================================= */
+/* ============================================================
+   ADMIN RESET
+============================================================ */
 
 app.post(
     "/api/dare/clear",
-    authenticateRequest,
     requireAuth,
     async (req, res) => {
-
         if (
             req.user.role !==
             "admin"
         ) {
-
             return sendError(
                 res,
                 403,
-                "ADMIN_REQUIRED",
-                "Administrator access is required."
+                "Administrator access required.",
+                "ADMIN_REQUIRED"
             );
         }
 
         try {
-
-            const result =
-                await pool.query(
-                    `
-                    DELETE FROM dares
-                    RETURNING id
-                    `
-                );
+            await pool.query(
+                `
+                DELETE FROM dares
+                `
+            );
 
             broadcast({
                 type:
@@ -4566,14 +4712,9 @@ app.post(
             });
 
             return res.json({
-                success: true,
-
-                deleted:
-                    result.rows.length
+                success: true
             });
-
         } catch (error) {
-
             console.error(
                 "Clear dares error:",
                 error
@@ -4582,36 +4723,38 @@ app.post(
             return sendError(
                 res,
                 500,
-                "CLEAR_FAILED",
-                "Could not clear dares."
+                "Unable to clear dares."
             );
         }
     }
 );
 
-/* =========================================================
+/* ============================================================
    404
-========================================================= */
+============================================================ */
 
 app.use(
     (req, res) => {
-
         return sendError(
             res,
             404,
-            "NOT_FOUND",
-            "Endpoint not found."
+            "Endpoint not found.",
+            "NOT_FOUND"
         );
     }
 );
 
-/* =========================================================
+/* ============================================================
    ERROR HANDLER
-========================================================= */
+============================================================ */
 
 app.use(
-    (error, req, res, next) => {
-
+    (
+        error,
+        req,
+        res,
+        next
+    ) => {
         console.error(
             "Unhandled server error:",
             error
@@ -4626,56 +4769,44 @@ app.use(
         return sendError(
             res,
             500,
-            "INTERNAL_ERROR",
             "Internal server error."
         );
     }
 );
 
-/* =========================================================
+/* ============================================================
    START SERVER
-========================================================= */
+============================================================ */
 
 async function startServer() {
-
     try {
-
         await initializeDatabase();
 
         /*
-         * After a Render restart, no controller
-         * WebSocket sessions exist yet.
-         *
-         * Therefore all streamers should begin offline.
+         * Make sure no streamer is accidentally
+         * left online after a Render restart.
          */
 
         await pool.query(`
             UPDATE streamers
-            SET connected = FALSE
+            SET
+                connected = FALSE,
+                updated_at = NOW()
         `);
 
         server.listen(
             PORT,
             () => {
-
                 console.log(
-                    `🚀 DARE Backend running on port ${PORT}`
+                    "========================================"
                 );
 
                 console.log(
-                    `🌐 Frontend origin: ${FRONTEND_ORIGIN}`
+                    "🚀 Nerve DARE Backend"
                 );
 
                 console.log(
-                    `🧠 Identity: Nerve Account`
-                );
-
-                console.log(
-                    `🔐 Authentication: enabled`
-                );
-
-                console.log(
-                    `🗄️ PostgreSQL: connected`
+                    `🌐 HTTP: listening on ${PORT}`
                 );
 
                 console.log(
@@ -4683,15 +4814,21 @@ async function startServer() {
                 );
 
                 console.log(
-                    `🎥 Platform identity: optional`
+                    `🎨 Frontend: ${FRONTEND_ORIGIN}`
+                );
+
+                console.log(
+                    "🗄️ PostgreSQL: connected"
+                );
+
+                console.log(
+                    "========================================"
                 );
             }
         );
-
     } catch (error) {
-
         console.error(
-            "❌ Failed to start server:",
+            "❌ Server startup failed:",
             error
         );
 
@@ -4699,56 +4836,70 @@ async function startServer() {
     }
 }
 
-/* =========================================================
+/* ============================================================
    GRACEFUL SHUTDOWN
-========================================================= */
+============================================================ */
 
 async function shutdown(
     signal
 ) {
-
     console.log(
         `${signal} received. Shutting down...`
     );
 
     try {
-
-        /*
-         * Nobody is connected once this
-         * process is shutting down.
-         */
-
         await pool.query(`
             UPDATE streamers
-            SET connected = FALSE
+            SET
+                connected = FALSE,
+                updated_at = NOW()
         `);
-
     } catch (error) {
-
-        console.error(
-            "Shutdown database update error:",
-            error
+        console.warn(
+            "Could not reset streamer status:",
+            error.message
         );
     }
 
+    /*
+     * Close WebSocket clients first.
+     */
+
+    for (
+        const socket of wss.clients
+    ) {
+        try {
+            socket.close(
+                1001,
+                "Server shutting down"
+            );
+        } catch (_) {}
+    }
+
+    wss.close(
+        () => {}
+    );
+
     server.close(
         async () => {
-
             try {
-
                 await pool.end();
+            } catch (_) {}
 
-            } catch (error) {
-
-                console.error(
-                    "Pool shutdown error:",
-                    error
-                );
-            }
+            console.log(
+                "Server stopped."
+            );
 
             process.exit(0);
         }
     );
+
+    setTimeout(
+        () => {
+            process.exit(1);
+        },
+        10000
+    ).unref();
 }
 
 process.on(
@@ -4759,6 +4910,26 @@ process.on(
 process.on(
     "SIGINT",
     () => shutdown("SIGINT")
+);
+
+process.on(
+    "uncaughtException",
+    (error) => {
+        console.error(
+            "UNCAUGHT EXCEPTION:",
+            error
+        );
+    }
+);
+
+process.on(
+    "unhandledRejection",
+    (error) => {
+        console.error(
+            "UNHANDLED REJECTION:",
+            error
+        );
+    }
 );
 
 startServer();
