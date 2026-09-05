@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 const express = require("express");
 const http = require("http");
@@ -21,7 +21,7 @@ const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
-    console.error("❌ DATABASE_URL is missing.");
+    console.error("âŒ DATABASE_URL is missing.");
     process.exit(1);
 }
 
@@ -1029,7 +1029,7 @@ async function initializeDatabase() {
         );
 
         console.log(
-            "✅ PostgreSQL database initialized."
+            "âœ… PostgreSQL database initialized."
         );
     } catch (error) {
         await client.query(
@@ -1037,7 +1037,7 @@ async function initializeDatabase() {
         );
 
         console.error(
-            "❌ Database initialization failed:",
+            "âŒ Database initialization failed:",
             error
         );
 
@@ -1291,7 +1291,7 @@ app.get(
 );
 
 /* ============================================================
-   AUTH — REGISTER
+   AUTH â€” REGISTER
 ============================================================ */
 
 app.post(
@@ -1552,7 +1552,7 @@ app.post(
 );
 
 /* ============================================================
-   AUTH — LOGIN
+   AUTH â€” LOGIN
 ============================================================ */
 
 app.post(
@@ -1735,7 +1735,7 @@ app.post(
 );
 
 /* ============================================================
-   AUTH — ME
+   AUTH â€” ME
 ============================================================ */
 
 app.get(
@@ -1783,7 +1783,7 @@ app.get(
 );
 
 /* ============================================================
-   AUTH — LOGOUT
+   AUTH â€” LOGOUT
 ============================================================ */
 
 app.post(
@@ -1821,7 +1821,7 @@ app.post(
 );
 
 /* ============================================================
-   AUTH — LOGOUT ALL
+   AUTH â€” LOGOUT ALL
 ============================================================ */
 
 app.post(
@@ -1876,7 +1876,6 @@ app.get(
                         platform_username,
                         connected
                     FROM streamers
-                    WHERE connected = TRUE
                     ORDER BY
                         LOWER(display_name),
                         id
@@ -3277,28 +3276,24 @@ app.post(
         }
 
         if (!streamer) {
-            return sendError(
-                res,
-                404,
-                "Streamer not found.",
-                "STREAMER_NOT_FOUND"
-            );
-        }
-
-        /*
-         * Only currently connected streamers
-         * can receive public dares.
-         */
-
-        if (
-            !streamer.connected
-        ) {
-            return sendError(
-                res,
-                409,
-                "That streamer is currently offline.",
-                "STREAMER_OFFLINE"
-            );
+            // AUTO-CREATE: allow dares to any valid username even if streamer never registered
+            const candidate = normalizeUsername(body.streamer);
+            if (candidate && isValidUsername(candidate)) {
+                try {
+                    const created = await pool.query(`
+                        INSERT INTO streamers (username, display_name, source, connected)
+                        VALUES ($1, $2, 'auto', FALSE)
+                        ON CONFLICT ON CONSTRAINT streamers_username_lower_unique DO UPDATE SET updated_at=NOW()
+                        RETURNING *
+                    `, [candidate, cleanDisplayUsername(body.streamer)]);
+                    streamer = created.rows[0];
+                } catch (e) {
+                    console.warn("Auto-create streamer failed:", e.message);
+                    return sendError(res, 404, "Streamer not found.", "STREAMER_NOT_FOUND");
+                }
+            } else {
+                return sendError(res, 404, "Streamer not found.", "STREAMER_NOT_FOUND");
+            }
         }
 
         const viewer =
@@ -3367,7 +3362,7 @@ app.post(
             return sendError(
                 res,
                 400,
-                `Reward must be between ₱0 and ₱${MAX_REWARD.toLocaleString()}.`,
+                `Reward must be between â‚±0 and â‚±${MAX_REWARD.toLocaleString()}.`,
                 "INVALID_REWARD"
             );
         }
@@ -3446,11 +3441,7 @@ app.post(
                         $5,
                         $6,
                         $7,
-                        CASE
-                            WHEN $7 = 'accepted'
-                            THEN NOW()
-                            ELSE NULL
-                        END
+                        $8
                     )
                     RETURNING *
                     `,
@@ -3461,7 +3452,7 @@ app.post(
                         dareText,
                         duration,
                         reward,
-                        status
+                        status === "accepted" ? new Date() : null
                     ]
                 );
 
@@ -4848,23 +4839,23 @@ async function startServer() {
                 );
 
                 console.log(
-                    "🚀 Nerve DARE Backend"
+                    "ðŸš€ Nerve DARE Backend"
                 );
 
                 console.log(
-                    `🌐 HTTP: listening on ${PORT}`
+                    `ðŸŒ HTTP: listening on ${PORT}`
                 );
 
                 console.log(
-                    `🔌 WebSocket: /ws`
+                    `ðŸ”Œ WebSocket: /ws`
                 );
 
                 console.log(
-                    `🎨 Frontend: ${FRONTEND_ORIGIN}`
+                    `ðŸŽ¨ Frontend: ${FRONTEND_ORIGIN}`
                 );
 
                 console.log(
-                    "🗄️ PostgreSQL: connected"
+                    "ðŸ—„ï¸ PostgreSQL: connected"
                 );
 
                 console.log(
@@ -4874,7 +4865,7 @@ async function startServer() {
         );
     } catch (error) {
         console.error(
-            "❌ Server startup failed:",
+            "âŒ Server startup failed:",
             error
         );
 
@@ -4979,3 +4970,5 @@ process.on(
 );
 
 startServer();
+
+
