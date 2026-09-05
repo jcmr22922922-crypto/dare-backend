@@ -21,14 +21,19 @@ if (!DATABASE_URL) {
    CONFIG
 ========================================================= */
 
-const FRONTEND_ORIGIN =
-    (
-        process.env.FRONTEND_ORIGIN ||
-        "https://jcmr22922922-crypto.github.io"
-    ).replace(/\/+$/, "");
+const FRONTEND_ORIGIN = (
+    process.env.FRONTEND_ORIGIN ||
+    "https://jcmr22922922-crypto.github.io"
+).replace(/\/+$/, "");
+
+const SESSION_DAYS_RAW =
+    Number(process.env.SESSION_DAYS || 30);
 
 const SESSION_DAYS =
-    Number(process.env.SESSION_DAYS || 30);
+    Number.isFinite(SESSION_DAYS_RAW) &&
+    SESSION_DAYS_RAW > 0
+        ? SESSION_DAYS_RAW
+        : 30;
 
 const SESSION_TTL_MS =
     SESSION_DAYS *
@@ -235,8 +240,6 @@ function sendError(
 
 /* =========================================================
    PASSWORD HASHING
-   Uses Node's built-in scrypt.
-   No extra bcrypt dependency required.
 ========================================================= */
 
 const SCRYPT_KEY_LENGTH = 64;
@@ -455,7 +458,6 @@ function parseCookies(req) {
 
 /* =========================================================
    COOKIE HELPER
-   Cross-site GitHub Pages → Render authentication
 ========================================================= */
 
 function appendCookie(
@@ -521,16 +523,6 @@ function appendCookie(
     }
 
 
-    /*
-     * GitHub Pages and Render are different sites.
-     *
-     * Partitioned allows the session cookie to work
-     * as a partitioned cross-site cookie in browsers
-     * that support CHIPS.
-     *
-     * Secure is required for Partitioned cookies.
-     */
-
     if (
         options.partitioned
     ) {
@@ -570,6 +562,29 @@ function appendCookie(
         );
 
     }
+
+}
+
+
+function setSessionCookie(
+    res,
+    token
+) {
+
+    appendCookie(
+        res,
+        "dare_session",
+        token,
+        {
+            maxAge:
+                SESSION_TTL_MS / 1000,
+            httpOnly: true,
+            secure: true,
+            sameSite: "None",
+            partitioned: true,
+            path: "/"
+        }
+    );
 
 }
 
@@ -747,7 +762,9 @@ async function initializeDatabase() {
         );
 
 
-        /* USERS */
+        /* =========================
+           USERS
+        ========================= */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS users (
@@ -801,7 +818,9 @@ async function initializeDatabase() {
         `);
 
 
-        /* SESSIONS */
+        /* =========================
+           SESSIONS
+        ========================= */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS sessions (
@@ -836,7 +855,9 @@ async function initializeDatabase() {
         `);
 
 
-        /* STREAMERS */
+        /* =========================
+           STREAMERS
+        ========================= */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS streamers (
@@ -861,6 +882,55 @@ async function initializeDatabase() {
         `);
 
 
+        /*
+         * IMPORTANT DATABASE MIGRATION
+         *
+         * Your existing PostgreSQL database was created
+         * before owner_user_id existed.
+         *
+         * CREATE TABLE IF NOT EXISTS does NOT modify an
+         * existing table, so explicitly add the column.
+         */
+
+        await client.query(`
+            ALTER TABLE streamers
+            ADD COLUMN IF NOT EXISTS owner_user_id BIGINT
+        `);
+
+
+        /*
+         * Make sure the ownership foreign key exists.
+         *
+         * The DO block checks PostgreSQL's catalog first,
+         * so it will not attempt to create the same
+         * constraint twice.
+         */
+
+        await client.query(`
+            DO $$
+            BEGIN
+
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname =
+                        'streamers_owner_user_fk'
+                ) THEN
+
+                    ALTER TABLE streamers
+                    ADD CONSTRAINT
+                        streamers_owner_user_fk
+                    FOREIGN KEY (owner_user_id)
+                    REFERENCES users(id)
+                    ON DELETE SET NULL;
+
+                END IF;
+
+            END
+            $$;
+        `);
+
+
         await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             streamers_username_lower_unique
@@ -877,7 +947,9 @@ async function initializeDatabase() {
         `);
 
 
-        /* EXISTING DARES TABLE */
+        /* =========================
+           DARES
+        ========================= */
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS dares (
@@ -933,14 +1005,9 @@ async function initializeDatabase() {
         );
 
 
-        /*
-         * Seed the temporary development streamer.
-         *
-         * It starts unowned.
-         *
-         * The first registered account can claim
-         * an unowned default streamer.
-         */
+        /* =========================
+           SEED DEFAULT STREAMER
+        ========================= */
 
         await pool.query(
             `
@@ -970,6 +1037,10 @@ async function initializeDatabase() {
 
         console.log(
             "✅ Database initialized."
+        );
+
+        console.log(
+            "✅ Streamer ownership migration checked."
         );
 
     } catch (error) {
@@ -1298,6 +1369,11 @@ app.post(
                     userResult.rows[0];
 
 
+                /*
+                 * Automatically assign the default streamer
+                 * to the first account that registers.
+                 */
+
                 await client.query(
                     `
                     UPDATE streamers
@@ -1338,9 +1414,9 @@ app.post(
             }
 
 
-            /*
-             * Automatically log the new account in.
-             */
+            /* =========================
+               AUTO LOGIN
+            ========================= */
 
             const token =
                 generateSessionToken();
@@ -1372,19 +1448,9 @@ app.post(
             );
 
 
-            appendCookie(
+            setSessionCookie(
                 res,
-                "dare_session",
-                token,
-                {
-                    maxAge:
-                        SESSION_TTL_MS / 1000,
-                    httpOnly: true,
-                    secure: true,
-                    sameSite: "None",
-                    partitioned: true,
-                    path: "/"
-                }
+                token
             );
 
 
@@ -1558,33 +1624,9 @@ app.post(
             );
 
 
-            /*
-             * IMPORTANT:
-             *
-             * The frontend is on GitHub Pages and the
-             * backend is on Render, so this is a
-             * cross-site session cookie.
-             *
-             * SameSite=None + Secure allows the cookie
-             * to be sent with credentialed requests.
-             *
-             * Partitioned provides CHIPS support for
-             * browsers that support partitioned cookies.
-             */
-
-            appendCookie(
+            setSessionCookie(
                 res,
-                "dare_session",
-                token,
-                {
-                    maxAge:
-                        SESSION_TTL_MS / 1000,
-                    httpOnly: true,
-                    secure: true,
-                    sameSite: "None",
-                    partitioned: true,
-                    path: "/"
-                }
+                token
             );
 
 
@@ -2464,10 +2506,6 @@ app.post(
                 );
 
 
-            /* =========================
-               STREAMER
-            ========================= */
-
             streamer =
                 cleanDisplayUsername(
                     streamer
@@ -2503,10 +2541,6 @@ app.post(
             }
 
 
-            /* =========================
-               SOURCE
-            ========================= */
-
             streamerSource =
                 String(
                     streamerSource
@@ -2538,10 +2572,6 @@ app.post(
             }
 
 
-            /* =========================
-               VIEWER
-            ========================= */
-
             viewer =
                 cleanText(
                     viewer ||
@@ -2554,10 +2584,6 @@ app.post(
                 viewer = "Anonymous";
             }
 
-
-            /* =========================
-               DARE TEXT
-            ========================= */
 
             dareText =
                 cleanText(
@@ -2578,10 +2604,6 @@ app.post(
             }
 
 
-            /* =========================
-               DURATION
-            ========================= */
-
             if (
                 !Number.isInteger(
                     duration
@@ -2600,10 +2622,6 @@ app.post(
             }
 
 
-            /* =========================
-               REWARD
-            ========================= */
-
             if (
                 reward === null
             ) {
@@ -2617,10 +2635,6 @@ app.post(
 
             }
 
-
-            /* =========================
-               STREAMER EXISTS
-            ========================= */
 
             const streamerResult =
                 await client.query(
@@ -2677,20 +2691,10 @@ app.post(
                 streamerRecord.username;
 
 
-            /* =========================
-               TRANSACTION
-            ========================= */
-
             await client.query(
                 "BEGIN"
             );
 
-
-            /*
-             * Prevent two submissions for the
-             * same streamer from both becoming
-             * active at the same time.
-             */
 
             await client.query(
                 `
@@ -2788,10 +2792,6 @@ app.post(
             );
 
 
-            /* =========================
-               BROADCAST
-            ========================= */
-
             broadcast({
                 type:
                     "DARE_CREATED",
@@ -2816,10 +2816,6 @@ app.post(
 
             }
 
-
-            /*
-             * Always update queue state.
-             */
 
             const queueResult =
                 await pool.query(
@@ -3192,10 +3188,6 @@ app.post(
                 dareResult.rows[0];
 
 
-            /* =========================
-               OWNERSHIP
-            ========================= */
-
             const ownershipResult =
                 await client.query(
                     `
@@ -3234,10 +3226,6 @@ app.post(
             }
 
 
-            /* =========================
-               STATE MACHINE
-            ========================= */
-
             if (
                 status === "accepted"
             ) {
@@ -3261,10 +3249,6 @@ app.post(
 
                 }
 
-
-                /*
-                 * Prevent another active dare.
-                 */
 
                 const active =
                     await client.query(
@@ -3581,11 +3565,6 @@ app.post(
                 });
 
 
-                /*
-                 * Automatically activate the next
-                 * pending dare.
-                 */
-
                 await activateNextDare(
                     dare.streamer
                 );
@@ -3828,7 +3807,6 @@ async function activateNextDare(
 
 /* =========================================================
    DARE HISTORY
-   AUTHENTICATED ONLY
 ========================================================= */
 
 app.get(
@@ -4088,6 +4066,10 @@ async function startServer() {
 
 }
 
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
 
 process.on(
     "SIGTERM",
