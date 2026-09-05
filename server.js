@@ -621,50 +621,34 @@ async function authenticateRequest(
 
     try {
 
-        const cookies =
-            parseCookies(req);
+        const cookies = parseCookies(req);
 
+const authorization =
+    req.headers.authorization || "";
 
-        /*
-         * First try the HttpOnly session cookie.
-         */
+let token = null;
+let usedCookie = false;
 
-        let token =
-            cookies.dare_session;
+/*
+ * Prefer Authorization Bearer token.
+ * This prevents an old/stale cookie from overriding
+ * the valid token stored in localStorage.
+ */
+if (authorization.startsWith("Bearer ")) {
 
-        let usedCookie =
-            Boolean(token);
+    token =
+        authorization
+            .slice(7)
+            .trim();
 
+} else if (cookies.dare_session) {
 
-        /*
-         * If there is no cookie, try:
-         *
-         * Authorization: Bearer <sessionToken>
-         *
-         * This is important for GitHub Pages -> Render
-         * cross-site authentication.
-         */
+    token =
+        cookies.dare_session;
 
-        if (!token) {
+    usedCookie = true;
 
-            const authorization =
-                req.headers.authorization ||
-                "";
-
-            if (
-                authorization.startsWith(
-                    "Bearer "
-                )
-            ) {
-
-                token =
-                    authorization
-                        .slice(7)
-                        .trim();
-
-            }
-
-        }
+}
 
 
         /*
