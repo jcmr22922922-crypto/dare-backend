@@ -610,6 +610,7 @@ function clearSessionCookie(res) {
 
 /* =========================================================
    AUTH MIDDLEWARE
+   COOKIE + BEARER TOKEN
 ========================================================= */
 
 async function authenticateRequest(
@@ -624,8 +625,41 @@ async function authenticateRequest(
             parseCookies(req);
 
 
-        const token =
+        /*
+         * First try the normal HTTP-only cookie.
+         */
+
+        let token =
             cookies.dare_session;
+
+
+        /*
+         * If the cookie is unavailable because of
+         * cross-site browser restrictions, use:
+         *
+         * Authorization: Bearer <token>
+         */
+
+        if (!token) {
+
+            const authHeader =
+                req.headers.authorization || "";
+
+
+            if (
+                authHeader.startsWith(
+                    "Bearer "
+                )
+            ) {
+
+                token =
+                    authHeader
+                        .slice(7)
+                        .trim();
+
+            }
+
+        }
 
 
         if (!token) {
@@ -673,7 +707,22 @@ async function authenticateRequest(
 
             req.user = null;
 
-            clearSessionCookie(res);
+
+            /*
+             * Only clear the cookie when the cookie
+             * was actually supplied.
+             */
+
+            if (
+                cookies.dare_session
+            ) {
+
+                clearSessionCookie(
+                    res
+                );
+
+            }
+
 
             next();
 
@@ -687,10 +736,18 @@ async function authenticateRequest(
 
 
         req.user = {
-            id: session.user_id,
-            username: session.username,
-            email: session.email,
-            role: session.role,
+            id:
+                session.user_id,
+
+            username:
+                session.username,
+
+            email:
+                session.email,
+
+            role:
+                session.role,
+
             sessionId:
                 session.session_id
         };
@@ -702,7 +759,9 @@ async function authenticateRequest(
             SET last_seen_at = NOW()
             WHERE id = $1
             `,
-            [session.session_id]
+            [
+                session.session_id
+            ]
         );
 
 
@@ -884,12 +943,6 @@ async function initializeDatabase() {
 
         /*
          * IMPORTANT DATABASE MIGRATION
-         *
-         * Your existing PostgreSQL database was created
-         * before owner_user_id existed.
-         *
-         * CREATE TABLE IF NOT EXISTS does NOT modify an
-         * existing table, so explicitly add the column.
          */
 
         await client.query(`
@@ -897,14 +950,6 @@ async function initializeDatabase() {
             ADD COLUMN IF NOT EXISTS owner_user_id BIGINT
         `);
 
-
-        /*
-         * Make sure the ownership foreign key exists.
-         *
-         * The DO block checks PostgreSQL's catalog first,
-         * so it will not attempt to create the same
-         * constraint twice.
-         */
 
         await client.query(`
             DO $$
@@ -1369,11 +1414,6 @@ app.post(
                     userResult.rows[0];
 
 
-                /*
-                 * Automatically assign the default streamer
-                 * to the first account that registers.
-                 */
-
                 await client.query(
                     `
                     UPDATE streamers
@@ -1456,16 +1496,30 @@ app.post(
 
             return res.status(201).json({
                 success: true,
+
                 data: {
+
                     user: {
-                        id: user.id,
+                        id:
+                            user.id,
+
                         username:
                             user.username,
+
                         email:
                             user.email,
+
                         role:
                             user.role
-                    }
+                    },
+
+                    /*
+                     * IMPORTANT:
+                     * auth.js saves this token in localStorage.
+                     */
+
+                    sessionToken:
+                        token
                 }
             });
 
@@ -1632,16 +1686,30 @@ app.post(
 
             return res.json({
                 success: true,
+
                 data: {
+
                     user: {
-                        id: user.id,
+                        id:
+                            user.id,
+
                         username:
                             user.username,
+
                         email:
                             user.email,
+
                         role:
                             user.role
-                    }
+                    },
+
+                    /*
+                     * IMPORTANT:
+                     * auth.js saves this token in localStorage.
+                     */
+
+                    sessionToken:
+                        token
                 }
             });
 
@@ -1689,18 +1757,27 @@ app.get(
 
         return res.json({
             success: true,
+
             data: {
+
                 user: {
+
                     id:
                         req.user.id,
+
                     username:
                         req.user.username,
+
                     email:
                         req.user.email,
+
                     role:
                         req.user.role
+
                 }
+
             }
+
         });
 
     }
@@ -1849,12 +1926,16 @@ app.get(
                 streamers:
                     result.rows.map(
                         streamer => ({
+
                             username:
                                 streamer.username,
+
                             displayName:
                                 streamer.display_name,
+
                             connected:
                                 streamer.connected
+
                         })
                     )
             });
@@ -1916,16 +1997,22 @@ app.get(
                 streamers:
                     result.rows.map(
                         streamer => ({
+
                             id:
                                 streamer.id,
+
                             username:
                                 streamer.username,
+
                             displayName:
                                 streamer.display_name,
+
                             source:
                                 streamer.source,
+
                             connected:
                                 streamer.connected
+
                         })
                     )
             });
@@ -2359,12 +2446,16 @@ async function sendState(
                 streamers:
                     streamers.rows.map(
                         streamer => ({
+
                             username:
                                 streamer.username,
+
                             displayName:
                                 streamer.display_name,
+
                             connected:
                                 streamer.connected
+
                         })
                     )
             })
