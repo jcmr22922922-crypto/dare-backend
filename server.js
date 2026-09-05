@@ -610,7 +610,7 @@ function clearSessionCookie(res) {
 
 /* =========================================================
    AUTH MIDDLEWARE
-   COOKIE + BEARER TOKEN
+   SUPPORTS COOKIE + BEARER TOKEN
 ========================================================= */
 
 async function authenticateRequest(
@@ -626,34 +626,39 @@ async function authenticateRequest(
 
 
         /*
-         * First try the normal HTTP-only cookie.
+         * First try the HttpOnly session cookie.
          */
 
         let token =
             cookies.dare_session;
 
+        let usedCookie =
+            Boolean(token);
+
 
         /*
-         * If the cookie is unavailable because of
-         * cross-site browser restrictions, use:
+         * If there is no cookie, try:
          *
-         * Authorization: Bearer <token>
+         * Authorization: Bearer <sessionToken>
+         *
+         * This is important for GitHub Pages -> Render
+         * cross-site authentication.
          */
 
         if (!token) {
 
-            const authHeader =
-                req.headers.authorization || "";
-
+            const authorization =
+                req.headers.authorization ||
+                "";
 
             if (
-                authHeader.startsWith(
+                authorization.startsWith(
                     "Bearer "
                 )
             ) {
 
                 token =
-                    authHeader
+                    authorization
                         .slice(7)
                         .trim();
 
@@ -661,6 +666,10 @@ async function authenticateRequest(
 
         }
 
+
+        /*
+         * No authentication information.
+         */
 
         if (!token) {
 
@@ -701,28 +710,27 @@ async function authenticateRequest(
             );
 
 
+        /*
+         * Token was supplied but isn't valid.
+         */
+
         if (
             result.rows.length === 0
         ) {
 
             req.user = null;
 
-
             /*
-             * Only clear the cookie when the cookie
-             * was actually supplied.
+             * Only clear the cookie if the invalid
+             * credential actually came from the cookie.
+             *
+             * Do NOT clear the cookie because an invalid
+             * Authorization header was supplied.
              */
 
-            if (
-                cookies.dare_session
-            ) {
-
-                clearSessionCookie(
-                    res
-                );
-
+            if (usedCookie) {
+                clearSessionCookie(res);
             }
-
 
             next();
 
@@ -736,18 +744,10 @@ async function authenticateRequest(
 
 
         req.user = {
-            id:
-                session.user_id,
-
-            username:
-                session.username,
-
-            email:
-                session.email,
-
-            role:
-                session.role,
-
+            id: session.user_id,
+            username: session.username,
+            email: session.email,
+            role: session.role,
             sessionId:
                 session.session_id
         };
@@ -759,9 +759,7 @@ async function authenticateRequest(
             SET last_seen_at = NOW()
             WHERE id = $1
             `,
-            [
-                session.session_id
-            ]
+            [session.session_id]
         );
 
 
@@ -943,6 +941,9 @@ async function initializeDatabase() {
 
         /*
          * IMPORTANT DATABASE MIGRATION
+         *
+         * Existing databases may have been created before
+         * owner_user_id existed.
          */
 
         await client.query(`
@@ -950,6 +951,10 @@ async function initializeDatabase() {
             ADD COLUMN IF NOT EXISTS owner_user_id BIGINT
         `);
 
+
+        /*
+         * Make sure the ownership foreign key exists.
+         */
 
         await client.query(`
             DO $$
@@ -1414,6 +1419,11 @@ app.post(
                     userResult.rows[0];
 
 
+                /*
+                 * Automatically assign the default streamer
+                 * to the first account that registers.
+                 */
+
                 await client.query(
                     `
                     UPDATE streamers
@@ -1515,7 +1525,8 @@ app.post(
 
                     /*
                      * IMPORTANT:
-                     * auth.js saves this token in localStorage.
+                     * auth.js stores this in localStorage
+                     * and sends it as Authorization: Bearer
                      */
 
                     sessionToken:
@@ -1705,7 +1716,7 @@ app.post(
 
                     /*
                      * IMPORTANT:
-                     * auth.js saves this token in localStorage.
+                     * auth.js needs this token.
                      */
 
                     sessionToken:
@@ -1761,7 +1772,6 @@ app.get(
             data: {
 
                 user: {
-
                     id:
                         req.user.id,
 
@@ -1773,11 +1783,9 @@ app.get(
 
                     role:
                         req.user.role
-
                 }
 
             }
-
         });
 
     }
@@ -1926,7 +1934,6 @@ app.get(
                 streamers:
                     result.rows.map(
                         streamer => ({
-
                             username:
                                 streamer.username,
 
@@ -1935,7 +1942,6 @@ app.get(
 
                             connected:
                                 streamer.connected
-
                         })
                     )
             });
@@ -1997,7 +2003,6 @@ app.get(
                 streamers:
                     result.rows.map(
                         streamer => ({
-
                             id:
                                 streamer.id,
 
@@ -2012,7 +2017,6 @@ app.get(
 
                             connected:
                                 streamer.connected
-
                         })
                     )
             });
@@ -2446,7 +2450,6 @@ async function sendState(
                 streamers:
                     streamers.rows.map(
                         streamer => ({
-
                             username:
                                 streamer.username,
 
@@ -2455,7 +2458,6 @@ async function sendState(
 
                             connected:
                                 streamer.connected
-
                         })
                     )
             })
