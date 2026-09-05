@@ -3452,6 +3452,7 @@ app.post(
                         dareText,
                         duration,
                         reward,
+                        status,
                         status === "accepted" ? new Date() : null
                     ]
                 );
@@ -4970,5 +4971,4 @@ process.on(
 );
 
 startServer();
-
 
