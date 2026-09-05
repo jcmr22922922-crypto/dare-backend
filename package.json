@@ -1,19 +1,28 @@
 {
   "name": "dare-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Nerve DARE backend",
+  "description": "Nerve DARE backend — hardened, rate-limited, observable",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "lint": "node --check server.js && echo \"syntax OK\""
   },
   "engines": {
     "node": ">=20 <25"
   },
   "dependencies": {
+    "compression": "^1.8.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
     "pg": "^8.13.1",
     "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "dotenv": "^16.5.0"
   }
 }

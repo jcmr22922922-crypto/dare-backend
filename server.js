@@ -6,6 +6,12 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const crypto = require("crypto");
 const { Pool } = require("pg");
+try { require("dotenv").config(); } catch (_) {}
+let helmet, compression, morgan, rateLimit;
+try { helmet = require("helmet"); } catch (_) {}
+try { compression = require("compression"); } catch (_) {}
+try { morgan = require("morgan"); } catch (_) {}
+try { rateLimit = require("express-rate-limit"); } catch (_) {}
 
 const app = express();
 const server = http.createServer(app);
@@ -23,10 +29,13 @@ if (!DATABASE_URL) {
    CONFIG
 ============================================================ */
 
-const FRONTEND_ORIGIN = (
+const FRONTEND_ORIGINS = (
+    process.env.FRONTEND_ORIGINS ||
     process.env.FRONTEND_ORIGIN ||
     "https://jcmr22922922-crypto.github.io"
-).replace(/\/$/, "");
+).split(",").map(s=>s.trim().replace(/\/$/, "")).filter(Boolean);
+const FRONTEND_ORIGIN = FRONTEND_ORIGINS[0];
+function isAllowedOrigin(origin){ if(!origin) return true; return FRONTEND_ORIGINS.includes(origin); }
 
 const SESSION_DAYS = Math.max(
     1,
@@ -46,6 +55,9 @@ const MAX_DARE_LENGTH = 1000;
 const MIN_DARE_DURATION = 5;
 const MAX_DARE_DURATION = 300;
 const MAX_REWARD = 100000;
+const MAX_QUEUE_PER_STREAMER = Math.max(1, Number(process.env.MAX_QUEUE_PER_STREAMER || 20));
+const DARE_RATE_WINDOW_MS = 60 * 1000;
+const DARE_RATE_MAX = Math.max(1, Number(process.env.DARE_RATE_MAX || 5));
 
 /* ============================================================
    DATABASE
@@ -77,6 +89,10 @@ pool.on("error", (error) => {
 ============================================================ */
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
+if (helmet) app.use(helmet({ contentSecurityPolicy:false, crossOriginEmbedderPolicy:false }));
+if (compression) app.use(compression());
+if (morgan) app.use(morgan(process.env.NODE_ENV==="production" ? "combined" : "dev"));
 
 app.use(
     cors({
@@ -102,6 +118,15 @@ app.use(
         limit: "50kb"
     })
 );
+// ---------- rate limiters ----------
+let globalLimiter = (req,res,next)=>next();
+let dareLimiter = (req,res,next)=>next();
+if (rateLimit) {
+  globalLimiter = rateLimit({ windowMs: 15*60*1000, max: 300, standardHeaders:true, legacyHeaders:false, message:{error:"Too many requests, slow down.", code:"RATE_LIMITED"}});
+  dareLimiter = rateLimit({ windowMs: DARE_RATE_WINDOW_MS, max: DARE_RATE_MAX, standardHeaders:true, legacyHeaders:false, keyGenerator: (req)=> req.ip + "|" + String(req.body?.streamer || req.body?.streamerId || "").toLowerCase(), message:{error:"You are sending dares too fast. Try again in a minute.", code:"DARE_RATE_LIMITED"}});
+  app.use(globalLimiter);
+}
+app.use("/api/dare", (req,res,next)=>{ if(req.method==="POST" && req.path==="/" ) return dareLimiter(req,res,next); next(); });
 
 /* ============================================================
    HELPERS
@@ -164,8 +189,14 @@ function isValidPassword(password) {
 function cleanText(value, maxLength) {
     return String(value || "")
         .trim()
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
         .slice(0, maxLength);
 }
+function sanitizeDareText(value){
+    return String(value||"").replace(/<[^>]*>/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim().replace(/\s+/g, " ").slice(0, MAX_DARE_LENGTH);
+}
+const BLOCKED_WORDS = (process.env.BLOCKED_WORDS||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+function containsBlocked(text){ if(!BLOCKED_WORDS.length) return false; const low=text.toLowerCase(); return BLOCKED_WORDS.some(w=> low.includes(w)); }
 
 function parsePositiveInteger(value) {
     const number = Number(value);
@@ -2519,8 +2550,18 @@ async function getAllDareState() {
 
 const wss =
     new WebSocket.Server({
-        noServer: true
+        noServer: true,
+        perMessageDeflate: { zlibDeflateOptions:{chunkSize:1024, memLevel:7, level:3}, threshold:1024 },
+        maxPayload: 16*1024
     });
+function heartbeat(){ this.isAlive=true; }
+const wsHeartbeat = setInterval(()=>{
+  wss.clients.forEach(ws=>{
+    if(ws.isAlive===false) return ws.terminate();
+    ws.isAlive=false; try{ ws.ping(()=>{}); }catch(_){}
+  });
+}, 25000);
+if(wsHeartbeat.unref) wsHeartbeat.unref();
 
 function broadcast(
     message
@@ -2773,6 +2814,7 @@ server.on(
 wss.on(
     "connection",
     (socket) => {
+        socket.isAlive=true; socket.on("pong", heartbeat);
         socket.authenticated =
             false;
 
@@ -3267,12 +3309,14 @@ app.post(
             );
 
         const dareText =
-            cleanText(
+            sanitizeDareText(
                 body.dare_text ??
                     body.dareText ??
-                    body.text,
-                MAX_DARE_LENGTH
+                    body.text
             );
+        if (containsBlocked(dareText)) {
+            return sendError(res, 400, "Dare contains blocked language.", "BLOCKED_CONTENT");
+        }
 
         const duration =
             parsePositiveInteger(
@@ -3365,6 +3409,14 @@ app.post(
                     [streamer.id]
                 );
 
+            const pendingCountRes = await client.query(
+                "SELECT COUNT(*)::int AS c FROM dares WHERE streamer_id=$1 AND status='pending'",
+                [streamer.id]
+            );
+            if (pendingCountRes.rows[0].c >= MAX_QUEUE_PER_STREAMER) {
+                await client.query("ROLLBACK");
+                return sendError(res, 429, "This streamer's queue is full. Try again later.", "QUEUE_FULL");
+            }
             const status =
                 activeResult.rows
                     .length === 0
@@ -4687,24 +4739,18 @@ app.post(
     "/api/dare/clear",
     requireAuth,
     async (req, res) => {
-        if (
-            req.user.role !==
-            "admin"
-        ) {
-            return sendError(
-                res,
-                403,
-                "Administrator access required.",
-                "ADMIN_REQUIRED"
-            );
-        }
-
+        const isAdmin = req.user.role === "admin";
         try {
-            await pool.query(
-                `
+            if (isAdmin) {
+            await pool.query(`
                 DELETE FROM dares
-                `
-            );
+                `);
+            } else {
+                const own = await getStreamerForUser(req.user.id);
+                if (!own) return sendError(res, 404, "Streamer profile not found.", "STREAMER_NOT_FOUND");
+                await pool.query(`DELETE FROM dares WHERE streamer_id=$1`, [own.id]);
+                await broadcastQueue(own.id);
+            }
 
             broadcast({
                 type:
