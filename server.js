@@ -4199,12 +4199,19 @@ app.post(
                     req.user.id
                 );
 
+            // Fallback for legacy/auto-created rows where owner_user_id is NULL but username matches. Preserves security: only matching username can control.
+            const isOwnerByUsername =
+                row.owner_user_id == null &&
+                normalizeUsername(row.streamer_username) ===
+                    normalizeUsername(req.user.username);
+
             const isAdmin =
                 req.user.role ===
                 "admin";
 
             if (
                 !isOwner &&
+                !isOwnerByUsername &&
                 !isAdmin
             ) {
                 await client.query(
